@@ -90,6 +90,7 @@ async function getOracleBandUsdcPerXHype() {
             lowRaw: low,
             highRaw: high,
             precision: effectivePrecision,
+            oraclePrecision: oraclePrecision, // Original oracle precision (1e18)
             low: lowHuman,
             high: highHuman,
             mid: midHuman,
