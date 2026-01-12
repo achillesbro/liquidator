@@ -1,137 +1,290 @@
-require("dotenv").config()
-const axios = require("axios")
+require("dotenv").config();
 const cron = require('node-cron');
 const { ethers } = require("ethers");
 
+const { getCandidates, getBorrowShares, isLiquidatableWithSpot } = require("./utils/positions");
+const { sdkGetAccountState } = require("./utils/hyperlendIsolatedSdk");
+const { getSpotPriceFromPool, PRJX_POOL_ADDRESS } = require("./utils/prjxSpot");
 
-const CLOSE_FACTOR = 0.5 //close 50% of the position
-const MAX_AMOUNT = '115792089237316195423570985008687907853269984665640564039457584007913129639935'
+// Configuration
+const MAX_REPAY_USDC = process.env.MAX_REPAY_USDC ? BigInt(process.env.MAX_REPAY_USDC) : BigInt(2000 * 1e6); // 2000 USDC (6 decimals)
+const MIN_PROFIT_USDC = process.env.MIN_PROFIT_USDC ? BigInt(process.env.MIN_PROFIT_USDC) : 0n; // Minimum profit in USDC (6 decimals)
+const PAIR_ADDRESS = '0x78DD09e369f35D033a1d4ec1df39BC8a51c8B6fd';
+const USDC_ADDRESS = '0xb88339CB7199b77E23DB6E890353E22632Ba630f';
+const XHYPE_ADDRESS = '0xAc962FA04BF91B7fd0DC0c5C32414E0Ce3C51E03';
 
-const { prepareHops } = require("./utils/swap")
-const {
-    pairLargestSupplyWithLargestBorrow,
-    getDetailedPosition,
-    getLiquidatableWallets
-} = require("./utils/positions")
+const PAIR_ABI = [
+    "function toBorrowShares(uint256 amount, bool roundUp, bool previewInterest) view returns (uint256)",
+    "function toBorrowAmount(uint256 shares, bool roundUp, bool previewInterest) view returns (uint256)"
+];
 
-run()
+const CONTRACT_ABI = [
+    "function run(address borrower, uint128 sharesToLiquidate, uint256 minUsdcOut, uint256 deadline) external",
+    "function rescueTokens(address _token, uint256 _amount, bool _max, address _to) external",
+    "event LiquidationExecuted(address indexed borrower, uint128 sharesToLiquidate, uint256 repayAmount, uint256 premium, uint256 seizedXHype, uint256 usdcOut, uint256 profitUsdc)"
+];
+
+let attempts = {};
+// Solvent cooldown cache: borrower -> timestamp (24 hour TTL)
+let solventCooldown = {};
+
+const SOLVENT_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+run();
+
+// Self-test: Check SDK with sample borrower if provided
+if (process.env.SDK_SAMPLE_BORROWER) {
+    (async () => {
+        try {
+            console.log(`[SDK Self-Test] Checking borrower: ${process.env.SDK_SAMPLE_BORROWER}`);
+            const state = await sdkGetAccountState(PAIR_ADDRESS, process.env.SDK_SAMPLE_BORROWER);
+            console.log(`[SDK Self-Test] Result:`, JSON.stringify(state, (key, value) => 
+                typeof value === 'bigint' ? value.toString() : value, 2));
+        } catch (error) {
+            console.error(`[SDK Self-Test] Error:`, error.message);
+        }
+    })();
+}
 
 cron.schedule('* * * * *', async () => {
-    run()
+    run();
 });
 
-let attempts = {}
+async function run() {
+    if (process.env.BOT_PAUSED === 'true') {
+        console.log("Bot is paused");
+        return;
+    }
+    
+    // Fetch spot price once per run
+    let spotPrice = null;
+    try {
+        const spot = await getSpotPriceFromPool(PRJX_POOL_ADDRESS, XHYPE_ADDRESS, USDC_ADDRESS);
+        spotPrice = spot.spotPrice;
+        console.log(`Spot price: ${spotPrice.toFixed(6)} USDC per xHYPE`);
+    } catch (error) {
+        console.log(`Failed to fetch spot price: ${error.message}, falling back to simulation-only mode`);
+        spotPrice = null;
+    }
+    
+    const candidates = await getCandidates();
+    console.log(`Found ${candidates.length} candidates`);
 
-async function run(){
-    const wallets = await getLiquidatableWallets()
-
-    for (let wallet of wallets){
-        if (attempts[wallet.wallet_address] && attempts[wallet.wallet_address] > 15){
-            attempts[user] = 0;
+    for (let candidate of candidates) {
+        const borrower = ethers.getAddress(candidate);
+        
+        // Reset attempts after 15 failures
+        if (attempts[borrower] && attempts[borrower] > 15) {
+            attempts[borrower] = 0;
         }
-        if (attempts[wallet.wallet_address] && attempts[wallet.wallet_address] > 3){
-            attempts[user] += 1;
+        
+        // Skip if too many recent attempts
+        if (attempts[borrower] && attempts[borrower] > 3) {
+            attempts[borrower] += 1;
             continue;
         }
 
-        //get detailed users position
-        const positions = await getDetailedPosition(wallet.wallet_address)
+        try {
+            // Get borrower's position
+            const provider = new ethers.JsonRpcProvider(process.env.RPC_URL || process.env.RPC);
+            const { userBorrowShares } = await getBorrowShares(borrower);
+            
+            if (userBorrowShares === 0n) {
+                console.log(`Skipping ${borrower}: no borrow shares`);
+                continue;
+            }
 
-        //prepare position values
-        let supply = []
-        for (let pos of positions.supply){
-            let value = (Number(pos.amount) / Math.pow(10, Number(pos.decimals))) * (Number(pos.price) / Math.pow(10, 8))
-            supply.push({ 
-                underlying: pos.underlying,
-                value: value
-            })
+            // SDK pre-filter: Check if borrower is liquidatable (using cached spot price)
+            const liquidatableResult = await isLiquidatableWithSpot(borrower, spotPrice);
+            
+            if (liquidatableResult.ok && liquidatableResult.liquidatable === false) {
+                // SDK says not liquidatable - mark as solvent with cooldown
+                solventCooldown[borrower] = Date.now();
+                const spotStr = liquidatableResult.spotPrice?.toFixed(6) || 'N/A';
+                const liqStr = liquidatableResult.liquidationPrice?.toFixed(6) || 'N/A';
+                console.log(`SDK prefilter: solvent ${borrower} (spot=${spotStr}, liq=${liqStr})`);
+                continue;
+            } else if (liquidatableResult.ok && liquidatableResult.liquidatable === true) {
+                // SDK says liquidatable - proceed to simulation
+                const spotStr = liquidatableResult.spotPrice?.toFixed(6) || 'N/A';
+                const liqStr = liquidatableResult.liquidationPrice?.toFixed(6) || 'N/A';
+                console.log(`SDK prefilter: LIQUIDATABLE ${borrower} (spot=${spotStr}, liq=${liqStr})`);
+                // Continue to simulation gate below
+            } else if (!liquidatableResult.ok) {
+                // SDK failed - fall back to existing simulation gate
+                console.log(`SDK prefilter failed for ${borrower} (${liquidatableResult.error || 'unknown error'}), falling back to simulation`);
+                // Continue to simulation gate below
+            }
+
+            // Check solvent cooldown cache
+            if (solventCooldown[borrower]) {
+                const cooldownAge = Date.now() - solventCooldown[borrower];
+                if (cooldownAge < SOLVENT_COOLDOWN_MS) {
+                    console.log(`Skipping ${borrower}: in solvent cooldown (${Math.floor((SOLVENT_COOLDOWN_MS - cooldownAge) / 1000 / 60)}min remaining)`);
+                    continue;
+                } else {
+                    // Cooldown expired, remove from cache
+                    delete solventCooldown[borrower];
+                }
+            }
+
+            console.log(`Processing liquidation for ${borrower}`);
+            console.log(`  Borrow shares: ${userBorrowShares.toString()}`);
+
+            // Calculate shares to liquidate with cap
+            const pair = new ethers.Contract(PAIR_ADDRESS, PAIR_ABI, provider);
+            
+            // Convert MAX_REPAY_USDC to shares
+            const capShares = await pair.toBorrowShares.staticCall(MAX_REPAY_USDC, false, true);
+            const sharesToLiquidate = userBorrowShares < capShares ? userBorrowShares : capShares;
+            
+            // Convert shares to repayAmount
+            const repayAmount = await pair.toBorrowAmount.staticCall(sharesToLiquidate, true, true);
+            
+            console.log(`  Shares to liquidate: ${sharesToLiquidate.toString()}`);
+            console.log(`  Repay amount: ${repayAmount.toString()}`);
+
+            // Compute minOut based on repay requirement + minimum profit
+            const minOut = repayAmount + MIN_PROFIT_USDC;
+            console.log(`  Min USDC out: ${minOut.toString()}`);
+
+            // Prepare deadline (30 seconds)
+            const deadline = Math.floor(Date.now() / 1000) + 30;
+
+            // Create signer and contract instance (use signer for both simulation and execution)
+            const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+            const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+            
+            // Encoding invariants debug (when BOT_DEBUG=1)
+            if (process.env.BOT_DEBUG === '1') {
+                try {
+                    const calldata = contract.interface.encodeFunctionData("run", [
+                        borrower,
+                        sharesToLiquidate,
+                        minOut,
+                        deadline
+                    ]);
+                    console.log(`  [DEBUG] Encoded calldata length: ${calldata.length} chars (${(calldata.length - 2) / 2} bytes)`);
+                    
+                    // Decode back and verify
+                    const decoded = contract.interface.decodeFunctionData("run", calldata);
+                    const borrowerMatch = ethers.getAddress(decoded[0]) === ethers.getAddress(borrower);
+                    const sharesMatch = decoded[1] === sharesToLiquidate;
+                    const minOutMatch = decoded[2] === minOut;
+                    const deadlineMatch = decoded[3] === BigInt(deadline);
+                    
+                    if (borrowerMatch && sharesMatch && minOutMatch && deadlineMatch) {
+                        console.log(`  [DEBUG] Encoding roundtrip verified: all values match`);
+                    } else {
+                        console.warn(`  [DEBUG] Encoding roundtrip mismatch detected!`);
+                        if (!borrowerMatch) console.warn(`    Borrower: expected ${borrower}, got ${decoded[0]}`);
+                        if (!sharesMatch) console.warn(`    Shares: expected ${sharesToLiquidate.toString()}, got ${decoded[1].toString()}`);
+                        if (!minOutMatch) console.warn(`    MinOut: expected ${minOut.toString()}, got ${decoded[2].toString()}`);
+                        if (!deadlineMatch) console.warn(`    Deadline: expected ${deadline}, got ${decoded[3].toString()}`);
+                    }
+                } catch (debugError) {
+                    console.warn(`  [DEBUG] Encoding verification failed: ${debugError.message}`);
+                }
+            }
+            
+            // Simulate transaction via eth_call (using signer so from = owner address)
+            try {
+                await contract.run.staticCall(
+                    borrower,
+                    sharesToLiquidate,
+                    minOut,
+                    deadline
+                );
+                console.log(`  Simulation successful`);
+            } catch (simError) {
+                console.log(`  Simulation failed: ${simError.message}`);
+                if (attempts[borrower]) {
+                    attempts[borrower] += 1;
+                } else {
+                    attempts[borrower] = 1;
+                }
+                continue;
+            }
+
+            // Send transaction (using same contract instance)
+            const tx = await contract.run(
+                borrower,
+                sharesToLiquidate,
+                minOut,
+                deadline
+            );
+            
+            console.log(`Tx sent: ${tx.hash}`);
+            const receipt = await tx.wait();
+            console.log(`Tx confirmed in block ${receipt.blockNumber}`);
+
+            // Parse events to get profit
+            const event = receipt.logs.find(log => {
+                try {
+                    const parsed = contract.interface.parseLog(log);
+                    return parsed && parsed.name === 'LiquidationExecuted';
+                } catch {
+                    return false;
+                }
+            });
+
+            if (event) {
+                const parsed = contract.interface.parseLog(event);
+                const profitUsdc = parsed.args.profitUsdc;
+                console.log(`  Profit: ${ethers.formatUnits(profitUsdc, 6)} USDC`);
+
+                // Send Telegram notification if configured
+                if (process.env.TELEGRAM_TOKEN && process.env.TELEGRAM_CHAT_ID) {
+                    await sendTelegramNotification(
+                        borrower,
+                        sharesToLiquidate.toString(),
+                        ethers.formatUnits(repayAmount, 6),
+                        ethers.formatUnits(parsed.args.premium, 6),
+                        ethers.formatUnits(profitUsdc, 6)
+                    );
+                }
+            }
+
+            // Rescue profit
+            if (process.env.PROFIT_RECEIVER) {
+                const rescueTx = await contract.rescueTokens(USDC_ADDRESS, 0, true, process.env.PROFIT_RECEIVER);
+                console.log(`Rescue tx: ${rescueTx.hash}`);
+                await rescueTx.wait();
+            }
+
+            // Reset attempts on success
+            attempts[borrower] = 0;
+
+        } catch (error) {
+            console.error(`Error processing ${borrower}:`, error.message);
+            if (attempts[borrower]) {
+                attempts[borrower] += 1;
+            } else {
+                attempts[borrower] = 1;
+            }
         }
-
-        let borrow = []
-        for (let pos of positions.borrow){
-            let value = (Number(pos.amount) / Math.pow(10, Number(pos.decimals))) * (Number(pos.price) / Math.pow(10, 8))
-            borrow.push({ 
-                underlying: pos.underlying,
-                value: value
-            })
-        }
-
-        console.log(`Found liquidation for ${wallet.wallet_address}`)
-
-        //prepare pairs by size
-        const [pair] = pairLargestSupplyWithLargestBorrow(supply, borrow)
-        await prepareAndSend(wallet.wallet_address, pair, positions)
     }
 }
 
-async function prepareAndSend(user, pair, positions){
-    const supply = pair[0]
-    const borrow = pair[1]
-    
-    const pos = positions.supply.find(e => e.underlying == supply.underlying)
-    const posBorrow = positions.borrow.find(e => e.underlying == borrow.underlying)
+async function sendTelegramNotification(borrower, shares, repayAmount, premium, profit) {
+    try {
+        const axios = require('axios');
+        const message = `
+✅ Liquidation Executed
 
-    const collateralAmount = parseFloat((Number(pos.amount) / Math.pow(10, Number(pos.decimals))) * CLOSE_FACTOR).toFixed(Number(pos.decimals))
-    const debtAmount = parseFloat((Number(posBorrow.amount) / Math.pow(10, Number(posBorrow.decimals)))).toFixed(Number(posBorrow.decimals))
-
-    console.log(`- collateral: ${collateralAmount} ${supply.underlying}`)
-    console.log(`- debt: ${debtAmount * CLOSE_FACTOR} ${borrow.underlying}`)
-
-    if (attempts[user]){
-      attempts[user] += 1;
-    } else {
-      attempts[user] = 1;
+Borrower: ${borrower}
+Shares Liquidated: ${shares}
+Repay Amount: ${repayAmount} USDC
+Premium: ${premium} USDC
+Profit: ${profit} USDC
+`;
+        
+        await axios.post(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`, {
+            chat_id: process.env.TELEGRAM_CHAT_ID,
+            text: message,
+            parse_mode: 'HTML'
+        });
+    } catch (error) {
+        console.error("Failed to send Telegram notification:", error.message);
     }
-
-    //get swap route
-    let swap = (await axios.get(`https://api.liqd.ag/route?tokenA=${supply.underlying}&tokenB=${borrow.underlying}&amountIn=${collateralAmount}&multiHop=true`)).data
-
-    const amountOutRaw = parseFloat(Number(swap.data.bestPath.amountOut) * Math.pow(10, Number(posBorrow.decimals))).toFixed(0)
-    const debtToSeize = Number(swap.data.bestPath.amountOut) > (debtAmount * CLOSE_FACTOR) ? MAX_AMOUNT : amountOutRaw;
-    
-    console.log(`- seizing ${debtToSeize == MAX_AMOUNT ? "MAX" : debtToSeize} of debt`)
-
-    const hops = prepareHops(swap.data)
-
-    let tokens = [swap?.data.bestPath?.hop[0].tokenIn];
-    for (let i = 0; i < swap?.data.bestPath?.hop?.length; i++) {
-        tokens.push(swap?.data.bestPath?.hop[i]?.tokenOut);
-    }
-    
-    await sendTx(user, supply.underlying, borrow.underlying, debtToSeize, hops, tokens, 0)
 }
-
-async function sendTx(user, collateral, debt, debtAmount, hops, tokens, minAmountOut){
-    const provider = new ethers.JsonRpcProvider(process.env.SEND_RPC);
-    const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-
-    const abi = [
-        `function liquidate(address _user, address _collateral, address _debt, uint256 _debtAmount, tuple(address tokenIn, address tokenOut, uint8 routerIndex, uint24 fee, uint256 amountIn, bool stable)[][] _hops, address[] _tokens, uint256 _minAmountOut)`,
-        `function rescueTokens(address _token, uint256 _amount, bool _max, address _to)`
-    ];
-    const contract = new ethers.Contract(process.env.LIQUIDATOR, abi, signer);
-    
-    const tx = await contract.liquidate(
-        user,
-        collateral,
-        debt,
-        debtAmount,
-        hops,
-        tokens,
-        minAmountOut
-    );
-
-    console.log('Tx sent:', tx.hash);
-    await tx.wait();
-    console.log('Tx confirmed!');
-
-    //send profit to another wallet
-    let profit = await contract.rescueTokens(debt, 0, true, process.env.PROFIT_RECEIVER)
-    console.log(`removing profit: ${profit.hash}`)
-    await profit.wait()
-}
-
-
-
-
-

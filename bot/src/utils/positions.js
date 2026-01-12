@@ -1,142 +1,173 @@
-const axios = require("axios")
 const { ethers } = require("ethers");
+const fs = require("fs");
+const path = require("path");
+const { extractCandidatesFromCsv } = require("./csvCandidates");
+const { sdkGetUserLiquidationPrice } = require("./hyperlendIsolatedSdk");
 
-function pairLargestSupplyWithLargestBorrow(supplyBalances, borrowBalances) {
-    // Filter out zero-value entries
-    const sortedSupplies = supplyBalances
-        .filter(e => e.value > 0)
-        .sort((a, b) => b.value - a.value);
+const PAIR_ADDRESS = '0x78DD09e369f35D033a1d4ec1df39BC8a51c8B6fd';
 
-    const sortedBorrows = borrowBalances
-        .filter(e => e.value > 0)
-        .sort((a, b) => b.value - a.value);
+const PAIR_ABI = [
+    "function getUserSnapshot(address user) view returns (uint256 userAssetShares, uint256 userBorrowShares, uint256 userCollateralBalance)"
+];
 
-    // Zip pairs by index
-    const length = Math.min(sortedSupplies.length, sortedBorrows.length);
-    const result = [];
+const CANDIDATES_PATH = path.join(__dirname, "..", "candidates.json");
 
-    for (let i = 0; i < length; i++) {
-        result.push([sortedSupplies[i], sortedBorrows[i]]);
+// Singleton provider for reuse
+let providerInstance = null;
+
+function getProvider() {
+    if (!providerInstance) {
+        providerInstance = new ethers.JsonRpcProvider(process.env.RPC_URL || process.env.RPC);
     }
-
-    return result;
+    return providerInstance;
 }
 
-async function getDetailedPosition(user) {
-    const abi = [
-        "function getAllSuppliedBalancesWithPrices(address pool, address user) view returns (tuple(address underlying, uint256 amount, uint256 price, uint256 decimals)[])",
-        "function getAllBorrowedBalancesWithPrices(address pool, address user) view returns (tuple(address underlying, uint256 amount, uint256 price, uint256 decimals)[])"
-    ];
-
-    const provider = new ethers.JsonRpcProvider(process.env.RPC);
-    const contract = new ethers.Contract(process.env.BALANCES_READER, abi, provider);
-
-    try {
-        const resultSupply = await contract.getAllSuppliedBalancesWithPrices(process.env.POOL, user);
-        const resultBorrow = await contract.getAllBorrowedBalancesWithPrices(process.env.POOL, user);
-
-        return {
-            supply: resultSupply.map(entry => ({
-                underlying: entry.underlying,
-                amount: entry.amount.toString(),
-                price: entry.price.toString(),
-                decimals: entry.decimals.toString(),
-            })),
-            borrow: resultBorrow.map(entry => ({
-                underlying: entry.underlying,
-                amount: entry.amount.toString(),
-                price: entry.price.toString(),
-                decimals: entry.decimals.toString(),
-            })),
+/**
+ * Get liquidatable candidates for the isolated pair
+ * Priority: CSV export (if CANDIDATES_CSV_PATH set) > candidates.json fallback
+ */
+async function getCandidates() {
+    // Priority A: CSV export if CANDIDATES_CSV_PATH is set
+    const csvPath = process.env.CANDIDATES_CSV_PATH;
+    if (csvPath) {
+        try {
+            const resolvedPath = path.resolve(csvPath);
+            if (fs.existsSync(resolvedPath)) {
+                const candidates = extractCandidatesFromCsv(resolvedPath);
+                
+                if (candidates.length > 0) {
+                    // Write candidates.json
+                    const checksummedPair = ethers.getAddress(PAIR_ADDRESS);
+                    const output = {
+                        generatedAt: new Date().toISOString(),
+                        pair: checksummedPair,
+                        source: "csv_export",
+                        candidates: candidates
+                    };
+                    fs.writeFileSync(CANDIDATES_PATH, JSON.stringify(output, null, 2) + '\n');
+                    
+                    console.log(`CSV export: extracted ${candidates.length} candidates from ${resolvedPath}`);
+                    return candidates;
+                } else {
+                    console.log(`CSV export: no candidates found in ${resolvedPath}`);
+                }
+            } else {
+                console.log(`CSV file not found: ${resolvedPath}`);
+            }
+        } catch (error) {
+            console.log(`CSV export failed (${error.message}), falling back to candidates.json`);
         }
-    } catch (err) {
-        console.error("Failed to fetch data:", err);
-        throw err;
+    }
+    
+    // Fallback: candidates.json
+    if (fs.existsSync(CANDIDATES_PATH)) {
+        const data = JSON.parse(fs.readFileSync(CANDIDATES_PATH, 'utf8'));
+        const candidates = Array.isArray(data) ? data : (data.candidates || []);
+        return candidates
+            .filter(addr => ethers.isAddress(addr))
+            .map(addr => ethers.getAddress(addr));
+    }
+    
+    console.warn("No candidates.json found, returning empty list");
+    return [];
+}
+
+/**
+ * Write candidates to JSON file (legacy function, kept for compatibility)
+ * @param {string} outputPathOptional - Optional output path, defaults to bot/src/candidates.json
+ */
+async function writeCandidatesJson(outputPathOptional) {
+    const candidates = await getCandidates();
+    const outputPath = outputPathOptional || CANDIDATES_PATH;
+    const checksummedPair = ethers.getAddress(PAIR_ADDRESS);
+    
+    const output = {
+        generatedAt: new Date().toISOString(),
+        pair: checksummedPair,
+        source: "csv_export",
+        candidates: candidates
+    };
+    
+    fs.writeFileSync(outputPath, JSON.stringify(output, null, 2) + '\n');
+    return output;
+}
+
+/**
+ * Get borrower's borrow shares from isolated pair
+ * @param {string} borrower - Borrower address
+ * @returns {Object} { userBorrowShares: BigInt, userCollateralBalance?: BigInt }
+ */
+async function getBorrowShares(borrower) {
+    const provider = getProvider();
+    const pair = new ethers.Contract(PAIR_ADDRESS, PAIR_ABI, provider);
+    
+    try {
+        const [userAssetShares, userBorrowShares, userCollateralBalance] = await pair.getUserSnapshot(borrower);
+        return {
+            userBorrowShares: userBorrowShares,
+            userCollateralBalance: userCollateralBalance
+        };
+    } catch (error) {
+        console.error(`Failed to get snapshot for ${borrower}:`, error.message);
+        throw error;
     }
 }
 
-async function getLiquidatableWallets(){
-    const data = (await axios.get(`https://hyperlend-api.blockanalitica.com/wallets/bad-debt-wallets/?network=hyper&order=-total_supply_usd&p=1&p_size=15`)).data
-    return data.results;
+// Liquidation buffer in basis points (default 50 = 0.5%)
+const LIQ_BUFFER_BPS = process.env.LIQ_BUFFER_BPS ? parseInt(process.env.LIQ_BUFFER_BPS) : 50;
 
-    // const data = {
-    //     results: [
-    //         {
-    //             "wallet_address": "0x0af3318c4060eac02d50e140de2fb0e492b59ecb",
-    //             "total_supply": "2352.37022441269234673",
-    //             "total_supply_change": "30.697184056199319558",
-    //             "total_borrow": "948.8563641597621272",
-    //             "total_borrow_change": "83.969150420123719364",
-    //             "net": "1403.51386025300321491",
-    //             "health_rate": "0.991665",
-    //             "health_rate_change": "-0.082081",
-    //             "emode_category": 1,
-    //             "last_activity": "2025-05-14T16:26:04Z",
-    //             "supplied_assets": [
-    //                 {
-    //                     "symbol": "UBTC",
-    //                     "address": "0x9FDBdA0A5e284c32744D2f17Ee5c74B284993463"
-    //                 }
-    //             ],
-    //             "borrowed_assets": [
-    //                 {
-    //                     "symbol": "WHYPE",
-    //                     "address": "0x5555555555555555555555555555555555555555"
-    //                 }
-    //             ]
-    //         },
-    //         {
-    //             "wallet_address": "0x205166e9cd418e207ab9cde137c2c5d933f29d7e",
-    //             "total_supply": "74.856871372968637474",
-    //             "total_supply_change": "-0.01858664335893096",
-    //             "total_borrow": "54.29953040465301826",
-    //             "total_borrow_change": "3.46221968137837370",
-    //             "net": "20.55734132863356384",
-    //             "health_rate": "0.972671",
-    //             "health_rate_change": "-0.087674",
-    //             "emode_category": 0,
-    //             "last_activity": "2025-05-14T17:21:20Z",
-    //             "supplied_assets": [
-    //                 {
-    //                     "symbol": "WHYPE",
-    //                     "address": "0x5555555555555555555555555555555555555555"
-    //                 },
-    //                 {
-    //                     "symbol": "USDe",
-    //                     "address": "0x5d3a1ff2b6bab83b63cd9ad0787074081a52ef34"
-    //                 },
-    //                 {
-    //                     "symbol": "UBTC",
-    //                     "address": "0x9FDBdA0A5e284c32744D2f17Ee5c74B284993463"
-    //                 },
-    //                 {
-    //                     "symbol": "USDT0",
-    //                     "address": "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb"
-    //                 },
-    //                 {
-    //                     "symbol": "UETH",
-    //                     "address": "0xBe6727B535545C67d5cAa73dEa54865B92CF7907"
-    //                 }
-    //             ],
-    //             "borrowed_assets": [
-    //                 {
-    //                     "symbol": "wstHYPE",
-    //                     "address": "0x94e8396e0869c9F2200760aF0621aFd240E1CF38"
-    //                 },
-    //                 {
-    //                     "symbol": "UETH",
-    //                     "address": "0xBe6727B535545C67d5cAa73dEa54865B92CF7907"
-    //                 }
-    //             ]
-    //         }
-    //     ]
-    // }
+/**
+ * Check if a borrower is liquidatable by comparing spot price to liquidation price
+ * @param {string} borrower - Borrower address
+ * @param {number|null} spotPrice - Cached spot price (USDC per xHYPE), or null if unavailable
+ * @returns {Object} { ok: boolean, liquidatable: boolean, spotPrice?: number, liquidationPrice?: number, threshold?: number, reason?: string, error?: string }
+ */
+async function isLiquidatableWithSpot(borrower, spotPrice) {
+    try {
+        // If spot price is not available, cannot determine liquidatability
+        if (spotPrice === null || spotPrice === undefined) {
+            return { ok: false, error: "no spot price" };
+        }
+        
+        // Get liquidation price from SDK
+        const { liquidationPrice } = await sdkGetUserLiquidationPrice(PAIR_ADDRESS, borrower);
+        
+        if (!liquidationPrice || liquidationPrice <= 0) {
+            return { ok: true, liquidatable: false, reason: "no_liq_price" };
+        }
+        
+        // Buffer: require spot <= liqPrice * (1 - buffer)
+        // e.g., if buffer = 50 bps (0.5%), threshold = liqPrice * 0.995
+        const buffer = (10000 - LIQ_BUFFER_BPS) / 10000;
+        const threshold = liquidationPrice * buffer;
+        
+        const liquidatable = spotPrice <= threshold;
+        
+        return { 
+            ok: true, 
+            liquidatable, 
+            spotPrice, 
+            liquidationPrice, 
+            threshold 
+        };
+    } catch (error) {
+        return { ok: false, error: error.message };
+    }
+}
 
-    // return data.results;
+/**
+ * Legacy function for backward compatibility - uses cached spot price
+ * @deprecated Use isLiquidatableWithSpot instead
+ */
+async function isLiquidatable(borrower) {
+    // This should not be called directly anymore - spot price must be passed
+    return { ok: false, error: "isLiquidatable requires spot price - use isLiquidatableWithSpot" };
 }
 
 module.exports = {
-    pairLargestSupplyWithLargestBorrow: pairLargestSupplyWithLargestBorrow,
-    getDetailedPosition: getDetailedPosition,
-    getLiquidatableWallets: getLiquidatableWallets
-}
+    getCandidates,
+    getBorrowShares,
+    writeCandidatesJson,
+    isLiquidatableWithSpot,
+    isLiquidatable // kept for compatibility but deprecated
+};
