@@ -1,7 +1,6 @@
 const { ethers } = require("ethers");
 const fs = require("fs");
 const path = require("path");
-const { extractCandidatesFromCsv } = require("./csvCandidates");
 const { sdkGetUserLiquidationPrice } = require("./hyperlendIsolatedSdk");
 
 const PAIR_ADDRESS = '0x78DD09e369f35D033a1d4ec1df39BC8a51c8B6fd';
@@ -23,43 +22,9 @@ function getProvider() {
 }
 
 /**
- * Get liquidatable candidates for the isolated pair
- * Priority: CSV export (if CANDIDATES_CSV_PATH set) > candidates.json fallback
+ * Get liquidatable candidates for the isolated pair from candidates.json
  */
 async function getCandidates() {
-    // Priority A: CSV export if CANDIDATES_CSV_PATH is set
-    const csvPath = process.env.CANDIDATES_CSV_PATH;
-    if (csvPath) {
-        try {
-            const resolvedPath = path.resolve(csvPath);
-            if (fs.existsSync(resolvedPath)) {
-                const candidates = extractCandidatesFromCsv(resolvedPath);
-                
-                if (candidates.length > 0) {
-                    // Write candidates.json
-                    const checksummedPair = ethers.getAddress(PAIR_ADDRESS);
-                    const output = {
-                        generatedAt: new Date().toISOString(),
-                        pair: checksummedPair,
-                        source: "csv_export",
-                        candidates: candidates
-                    };
-                    fs.writeFileSync(CANDIDATES_PATH, JSON.stringify(output, null, 2) + '\n');
-                    
-                    console.log(`CSV export: extracted ${candidates.length} candidates from ${resolvedPath}`);
-                    return candidates;
-                } else {
-                    console.log(`CSV export: no candidates found in ${resolvedPath}`);
-                }
-            } else {
-                console.log(`CSV file not found: ${resolvedPath}`);
-            }
-        } catch (error) {
-            console.log(`CSV export failed (${error.message}), falling back to candidates.json`);
-        }
-    }
-    
-    // Fallback: candidates.json
     if (fs.existsSync(CANDIDATES_PATH)) {
         const data = JSON.parse(fs.readFileSync(CANDIDATES_PATH, 'utf8'));
         const candidates = Array.isArray(data) ? data : (data.candidates || []);
@@ -117,16 +82,16 @@ async function getBorrowShares(borrower) {
 const LIQ_BUFFER_BPS = process.env.LIQ_BUFFER_BPS ? parseInt(process.env.LIQ_BUFFER_BPS) : 50;
 
 /**
- * Check if a borrower is liquidatable by comparing spot price to liquidation price
+ * Check if a borrower is liquidatable by comparing oracle high price to liquidation price
  * @param {string} borrower - Borrower address
- * @param {number|null} spotPrice - Cached spot price (USDC per xHYPE), or null if unavailable
- * @returns {Object} { ok: boolean, liquidatable: boolean, spotPrice?: number, liquidationPrice?: number, threshold?: number, reason?: string, error?: string }
+ * @param {number|null} oracleHighPrice - Cached oracle high price (USDC per xHYPE), or null if unavailable
+ * @returns {Object} { ok: boolean, liquidatable: boolean, oracleHighPrice?: number, liquidationPrice?: number, threshold?: number, reason?: string, error?: string }
  */
-async function isLiquidatableWithSpot(borrower, spotPrice) {
+async function isLiquidatableWithOracle(borrower, oracleHighPrice) {
     try {
-        // If spot price is not available, cannot determine liquidatability
-        if (spotPrice === null || spotPrice === undefined) {
-            return { ok: false, error: "no spot price" };
+        // If oracle price is not available, cannot determine liquidatability
+        if (oracleHighPrice === null || oracleHighPrice === undefined) {
+            return { ok: false, error: "no_oracle_price" };
         }
         
         // Get liquidation price from SDK
@@ -136,17 +101,17 @@ async function isLiquidatableWithSpot(borrower, spotPrice) {
             return { ok: true, liquidatable: false, reason: "no_liq_price" };
         }
         
-        // Buffer: require spot <= liqPrice * (1 - buffer)
+        // Buffer: require oracleHighPrice <= liqPrice * (1 - buffer)
         // e.g., if buffer = 50 bps (0.5%), threshold = liqPrice * 0.995
         const buffer = (10000 - LIQ_BUFFER_BPS) / 10000;
         const threshold = liquidationPrice * buffer;
         
-        const liquidatable = spotPrice <= threshold;
+        const liquidatable = oracleHighPrice <= threshold;
         
         return { 
             ok: true, 
             liquidatable, 
-            spotPrice, 
+            oracleHighPrice, 
             liquidationPrice, 
             threshold 
         };
@@ -157,17 +122,28 @@ async function isLiquidatableWithSpot(borrower, spotPrice) {
 
 /**
  * Legacy function for backward compatibility - uses cached spot price
- * @deprecated Use isLiquidatableWithSpot instead
+ * @deprecated Use isLiquidatableWithOracle instead
+ */
+async function isLiquidatableWithSpot(borrower, spotPrice) {
+    // This function is kept for compatibility but is deprecated
+    // Convert spotPrice to oracleHighPrice for the new function
+    return await isLiquidatableWithOracle(borrower, spotPrice);
+}
+
+/**
+ * Legacy function for backward compatibility
+ * @deprecated Use isLiquidatableWithOracle instead
  */
 async function isLiquidatable(borrower) {
-    // This should not be called directly anymore - spot price must be passed
-    return { ok: false, error: "isLiquidatable requires spot price - use isLiquidatableWithSpot" };
+    // This should not be called directly anymore - oracle price must be passed
+    return { ok: false, error: "isLiquidatable requires oracle price - use isLiquidatableWithOracle" };
 }
 
 module.exports = {
     getCandidates,
     getBorrowShares,
     writeCandidatesJson,
-    isLiquidatableWithSpot,
+    isLiquidatableWithOracle,
+    isLiquidatableWithSpot, // kept for compatibility but deprecated
     isLiquidatable // kept for compatibility but deprecated
 };

@@ -2,9 +2,9 @@ require("dotenv").config();
 const cron = require('node-cron');
 const { ethers } = require("ethers");
 
-const { getCandidates, getBorrowShares, isLiquidatableWithSpot } = require("./utils/positions");
+const { getCandidates, getBorrowShares, isLiquidatableWithOracle } = require("./utils/positions");
 const { sdkGetAccountState } = require("./utils/hyperlendIsolatedSdk");
-const { getSpotPriceFromPool, PRJX_POOL_ADDRESS } = require("./utils/prjxSpot");
+const { getOracleBandUsdcPerXHype } = require("./utils/hyperlendOracle");
 
 // Configuration
 const MAX_REPAY_USDC = process.env.MAX_REPAY_USDC ? BigInt(process.env.MAX_REPAY_USDC) : BigInt(2000 * 1e6); // 2000 USDC (6 decimals)
@@ -56,15 +56,20 @@ async function run() {
         return;
     }
     
-    // Fetch spot price once per run
-    let spotPrice = null;
+    // Fetch oracle price band once per run
+    let oracleHighPrice = null;
     try {
-        const spot = await getSpotPriceFromPool(PRJX_POOL_ADDRESS, XHYPE_ADDRESS, USDC_ADDRESS);
-        spotPrice = spot.spotPrice;
-        console.log(`Spot price: ${spotPrice.toFixed(6)} USDC per xHYPE`);
+        const oracle = await getOracleBandUsdcPerXHype();
+        if (oracle.isBadData) {
+            console.log(`Oracle bad data detected, falling back to simulation-only mode`);
+            oracleHighPrice = null;
+        } else {
+            oracleHighPrice = oracle.high;
+            console.log(`Oracle band: low=${oracle.lowStr}, high=${oracle.highStr}, badData=false`);
+        }
     } catch (error) {
-        console.log(`Failed to fetch spot price: ${error.message}, falling back to simulation-only mode`);
-        spotPrice = null;
+        console.log(`Failed to fetch oracle band: ${error.message}, falling back to simulation-only mode`);
+        oracleHighPrice = null;
     }
     
     const candidates = await getCandidates();
@@ -94,21 +99,21 @@ async function run() {
                 continue;
             }
 
-            // SDK pre-filter: Check if borrower is liquidatable (using cached spot price)
-            const liquidatableResult = await isLiquidatableWithSpot(borrower, spotPrice);
+            // SDK pre-filter: Check if borrower is liquidatable (using cached oracle price)
+            const liquidatableResult = await isLiquidatableWithOracle(borrower, oracleHighPrice);
             
             if (liquidatableResult.ok && liquidatableResult.liquidatable === false) {
                 // SDK says not liquidatable - mark as solvent with cooldown
                 solventCooldown[borrower] = Date.now();
-                const spotStr = liquidatableResult.spotPrice?.toFixed(6) || 'N/A';
+                const oracleStr = liquidatableResult.oracleHighPrice?.toFixed(6) || 'N/A';
                 const liqStr = liquidatableResult.liquidationPrice?.toFixed(6) || 'N/A';
-                console.log(`SDK prefilter: solvent ${borrower} (spot=${spotStr}, liq=${liqStr})`);
+                console.log(`SDK prefilter: solvent ${borrower} (oracle=${oracleStr}, liq=${liqStr})`);
                 continue;
             } else if (liquidatableResult.ok && liquidatableResult.liquidatable === true) {
                 // SDK says liquidatable - proceed to simulation
-                const spotStr = liquidatableResult.spotPrice?.toFixed(6) || 'N/A';
+                const oracleStr = liquidatableResult.oracleHighPrice?.toFixed(6) || 'N/A';
                 const liqStr = liquidatableResult.liquidationPrice?.toFixed(6) || 'N/A';
-                console.log(`SDK prefilter: LIQUIDATABLE ${borrower} (spot=${spotStr}, liq=${liqStr})`);
+                console.log(`SDK prefilter: LIQUIDATABLE ${borrower} (oracle=${oracleStr}, liq=${liqStr})`);
                 // Continue to simulation gate below
             } else if (!liquidatableResult.ok) {
                 // SDK failed - fall back to existing simulation gate
@@ -288,3 +293,4 @@ Profit: ${profit} USDC
         console.error("Failed to send Telegram notification:", error.message);
     }
 }
+
