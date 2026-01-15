@@ -2,6 +2,7 @@ const { ethers } = require("ethers");
 const fs = require("fs");
 const path = require("path");
 const { sdkGetUserLiquidationPrice } = require("./hyperlendIsolatedSdk");
+const { liquidationPriceToFP, PRICE_SCALE } = require("./hyperlendOracle");
 const { multicall } = require("./multicall3");
 
 const PAIR_ADDRESS = '0x78DD09e369f35D033a1d4ec1df39BC8a51c8B6fd';
@@ -31,18 +32,35 @@ function getProvider() {
 }
 
 /**
- * Get liquidatable candidates for the isolated pair from candidates.json
+ * Get liquidatable candidates for the isolated pair from candidates.json or candidates.<marketId>.json
+ * @param {string} marketId - Optional market ID (e.g. "XHYPE_USDC", "WHLP_USDT0"). If not provided, uses candidates.json
+ * @returns {Promise<string[]>} Array of candidate addresses
  */
-async function getCandidates() {
-    if (fs.existsSync(CANDIDATES_PATH)) {
-        const data = JSON.parse(fs.readFileSync(CANDIDATES_PATH, 'utf8'));
+async function getCandidates(marketId = null) {
+    let candidatesPath = CANDIDATES_PATH;
+    if (marketId) {
+        // Try market-specific file first
+        const marketCandidatesPath = path.join(__dirname, "..", `candidates.${marketId}.json`);
+        if (fs.existsSync(marketCandidatesPath)) {
+            candidatesPath = marketCandidatesPath;
+        } else if (fs.existsSync(CANDIDATES_PATH)) {
+            // Fall back to default candidates.json if market-specific file doesn't exist
+            candidatesPath = CANDIDATES_PATH;
+        } else {
+            console.warn(`No candidates file found for market ${marketId}, returning empty list`);
+            return [];
+        }
+    }
+    
+    if (fs.existsSync(candidatesPath)) {
+        const data = JSON.parse(fs.readFileSync(candidatesPath, 'utf8'));
         const candidates = Array.isArray(data) ? data : (data.candidates || []);
         return candidates
             .filter(addr => ethers.isAddress(addr))
             .map(addr => ethers.getAddress(addr));
     }
     
-    console.warn("No candidates.json found, returning empty list");
+    console.warn(`No candidates file found at ${candidatesPath}, returning empty list`);
     return [];
 }
 
@@ -69,19 +87,21 @@ async function writeCandidatesJson(outputPathOptional) {
 /**
  * Get batched snapshots for multiple borrowers using Multicall3
  * @param {string[]} borrowers - Array of borrower addresses
+ * @param {string} pairAddress - Pair contract address (optional, defaults to legacy PAIR_ADDRESS)
  * @returns {Promise<Map<string, {userBorrowShares: bigint, userCollateralBalance: bigint, userAssetShares: bigint} | null>>} Map of borrower address to snapshot
  */
-async function getSnapshots(borrowers) {
+async function getSnapshots(borrowers, pairAddress = null) {
     if (borrowers.length === 0) {
         return new Map();
     }
 
     const provider = getProvider();
     const iface = new ethers.Interface(PAIR_ABI);
+    const targetPairAddress = pairAddress || PAIR_ADDRESS;
 
     // Build calls array
     const calls = borrowers.map(borrower => ({
-        target: PAIR_ADDRESS,
+        target: targetPairAddress,
         callData: iface.encodeFunctionData("getUserSnapshot", [borrower]),
         allowFailure: true
     }));
@@ -291,37 +311,46 @@ async function getPairStaticParams(pairAddress, provider) {
 
 /**
  * Check if a borrower is liquidatable by comparing oracle high price to liquidation price
+ * Uses fixed-point BigInt for all comparisons (PRICE_DECIMALS=18)
+ * @param {string} pairAddress - Pair address (for SDK call)
  * @param {string} borrower - Borrower address
- * @param {number|null} oracleHighPrice - Cached oracle high price (USDC per xHYPE), or null if unavailable
- * @returns {Object} { ok: boolean, liquidatable: boolean, oracleHighPrice?: number, liquidationPrice?: number, threshold?: number, reason?: string, error?: string }
+ * @param {bigint} oracleHighPriceFP - Cached oracle high price in fixed-point (PRICE_SCALE = 1), or null if unavailable
+ * @returns {Object} { ok: boolean, liquidatable: boolean, oracleHighPriceFP?: bigint, liquidationPriceFP?: bigint, thresholdFP?: bigint, reason?: string, error?: string }
  */
-async function isLiquidatableWithOracle(borrower, oracleHighPrice) {
+async function isLiquidatableWithOracle(pairAddress, borrower, oracleHighPriceFP) {
     try {
         // If oracle price is not available, cannot determine liquidatability
-        if (oracleHighPrice === null || oracleHighPrice === undefined) {
+        if (oracleHighPriceFP === null || oracleHighPriceFP === undefined || oracleHighPriceFP === 0n) {
             return { ok: false, error: "no_oracle_price" };
         }
         
-        // Get liquidation price from SDK
-        const { liquidationPrice } = await sdkGetUserLiquidationPrice(PAIR_ADDRESS, borrower);
+        // Get liquidation price from SDK (returns formatted string)
+        const { liquidationPrice } = await sdkGetUserLiquidationPrice(pairAddress, borrower);
         
         if (!liquidationPrice || liquidationPrice <= 0) {
             return { ok: true, liquidatable: false, reason: "no_liq_price" };
         }
         
-        // Buffer: require oracleHighPrice <= liqPrice * (1 - buffer)
-        // e.g., if buffer = 50 bps (0.5%), threshold = liqPrice * 0.995
-        const buffer = (10000 - LIQ_BUFFER_BPS) / 10000;
-        const threshold = liquidationPrice * buffer;
+        // Convert liquidation price string to fixed-point BigInt
+        const liquidationPriceFP = liquidationPriceToFP(liquidationPrice.toString());
         
-        const liquidatable = oracleHighPrice <= threshold;
+        if (liquidationPriceFP === 0n) {
+            return { ok: true, liquidatable: false, reason: "liq_price_zero" };
+        }
+        
+        // Buffer: require oracleHighPriceFP <= liqPriceFP * (10000 - bufferBps) / 10000
+        // e.g., if buffer = 50 bps (0.5%), threshold = liqPriceFP * 9950 / 10000
+        const bufferMultiplier = 10000n - BigInt(LIQ_BUFFER_BPS);
+        const thresholdFP = (liquidationPriceFP * bufferMultiplier) / 10000n;
+        
+        const liquidatable = oracleHighPriceFP <= thresholdFP;
         
         return { 
             ok: true, 
             liquidatable, 
-            oracleHighPrice, 
-            liquidationPrice, 
-            threshold 
+            oracleHighPriceFP, 
+            liquidationPriceFP, 
+            thresholdFP 
         };
     } catch (error) {
         return { ok: false, error: error.message };
