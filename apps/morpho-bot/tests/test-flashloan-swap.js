@@ -12,7 +12,7 @@
  * The executor must have some balance to cover the loss.
  * 
  * Usage:
- *   FLASHLOAN_TOKEN=0x... SWAP_TOKEN=0x... FLASHLOAN_AMOUNT=1000000 node src/scripts/test-flashloan-swap.js
+ *   FLASHLOAN_TOKEN=0x... SWAP_TOKEN=0x... FLASHLOAN_AMOUNT=1000000 node tests/test-flashloan-swap.js
  */
 
 import 'dotenv/config';

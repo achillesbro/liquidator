@@ -12,7 +12,7 @@
  * since we're not doing any swaps to generate profit.
  * 
  * Usage:
- *   FLASHLOAN_TOKEN=0x... FLASHLOAN_AMOUNT=1000000 node src/scripts/test-flashloan-noop.js
+ *   FLASHLOAN_TOKEN=0x... FLASHLOAN_AMOUNT=1000000 node tests/test-flashloan-noop.js
  */
 
 import 'dotenv/config';

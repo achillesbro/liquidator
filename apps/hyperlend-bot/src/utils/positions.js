@@ -154,28 +154,6 @@ async function getSnapshots(borrowers, pairAddress = null) {
     return snapshots;
 }
 
-/**
- * Get borrower's borrow shares from isolated pair (legacy, single call)
- * @deprecated Use getSnapshots for batched calls instead
- * @param {string} borrower - Borrower address
- * @returns {Object} { userBorrowShares: BigInt, userCollateralBalance?: BigInt }
- */
-async function getBorrowShares(borrower) {
-    const provider = getProvider();
-    const pair = new ethers.Contract(PAIR_ADDRESS, PAIR_ABI, provider);
-    
-    try {
-        const [userAssetShares, userBorrowShares, userCollateralBalance] = await pair.getUserSnapshot(borrower);
-        return {
-            userBorrowShares: userBorrowShares,
-            userCollateralBalance: userCollateralBalance
-        };
-    } catch (error) {
-        console.error(`Failed to get snapshot for ${borrower}:`, error.message);
-        throw error;
-    }
-}
-
 // Liquidation buffer in basis points (default 50 = 0.5%)
 const LIQ_BUFFER_BPS = process.env.LIQ_BUFFER_BPS ? parseInt(process.env.LIQ_BUFFER_BPS) : 50;
 
@@ -357,33 +335,11 @@ async function isLiquidatableWithOracle(pairAddress, borrower, oracleHighPriceFP
     }
 }
 
-/**
- * Legacy function for backward compatibility - uses cached spot price
- * @deprecated Use isLiquidatableWithOracle instead
- */
-async function isLiquidatableWithSpot(borrower, spotPrice) {
-    // This function is kept for compatibility but is deprecated
-    // Convert spotPrice to oracleHighPrice for the new function
-    return await isLiquidatableWithOracle(borrower, spotPrice);
-}
-
-/**
- * Legacy function for backward compatibility
- * @deprecated Use isLiquidatableWithOracle instead
- */
-async function isLiquidatable(borrower) {
-    // This should not be called directly anymore - oracle price must be passed
-    return { ok: false, error: "isLiquidatable requires oracle price - use isLiquidatableWithOracle" };
-}
-
 module.exports = {
     getCandidates,
     getSnapshots,
-    getBorrowShares, // kept for compatibility but deprecated - use getSnapshots instead
     getBorrowAmountsFromShares,
     getPairStaticParams,
     writeCandidatesJson,
-    isLiquidatableWithOracle,
-    isLiquidatableWithSpot, // kept for compatibility but deprecated
-    isLiquidatable // kept for compatibility but deprecated
+    isLiquidatableWithOracle
 };

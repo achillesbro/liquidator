@@ -253,22 +253,6 @@ function liquidationPriceToFP(liquidationPriceStr) {
     return parseDecimalToBigint(liquidationPriceStr, PRICE_DECIMALS);
 }
 
-/**
- * Get oracle price band for a market (legacy wrapper for backward compatibility)
- * @deprecated Use fetchOracleBand instead
- */
-async function getOracleBand(oracleAddress, collateralDecimals, assetDecimals) {
-    throw new Error("getOracleBand is deprecated, use fetchOracleBand with token addresses");
-}
-
-/**
- * Get oracle price band in USDC per xHYPE (legacy function for backward compatibility)
- * @deprecated Use fetchOracleBand instead
- */
-async function getOracleBandUsdcPerXHype() {
-    throw new Error("getOracleBandUsdcPerXHype is deprecated, use fetchOracleBand");
-}
-
 module.exports = {
     fetchOracleBand,
     liquidationPriceToFP,
@@ -277,7 +261,5 @@ module.exports = {
     parseDecimalToBigint,
     toDecimalString,
     invertPriceFP,
-    getOracleBand, // Deprecated
-    getOracleBandUsdcPerXHype, // Legacy function
     ORACLE_ADDRESS
 };

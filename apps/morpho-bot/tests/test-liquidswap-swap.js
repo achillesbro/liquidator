@@ -7,7 +7,7 @@
  * 3. Execute swap via executor
  * 
  * Usage:
- *   TOKEN_IN=0x... TOKEN_OUT=0x... AMOUNT_IN=1000000 node src/scripts/test-liquidswap-swap.js
+ *   TOKEN_IN=0x... TOKEN_OUT=0x... AMOUNT_IN=1000000 node tests/test-liquidswap-swap.js
  */
 
 import 'dotenv/config';
