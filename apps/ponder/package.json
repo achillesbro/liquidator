@@ -1,0 +1,24 @@
+{
+  "name": "@apps/ponder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ponder indexer for Morpho Blue on HyperEVM",
+  "type": "module",
+  "scripts": {
+    "dev": "ponder dev --schema public",
+    "start": "ponder start --schema public",
+    "codegen": "ponder codegen"
+  },
+  "dependencies": {
+    "ponder": "^0.8.0",
+    "hono": "^4.0.0",
+    "viem": "^2.21.53",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

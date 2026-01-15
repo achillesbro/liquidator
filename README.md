@@ -1,3 +1,100 @@
+# Liquidator Monorepo
+
+Monorepo for liquidation bots supporting multiple protocols (HyperLend, Morpho).
+
+## Workspace Structure
+
+```
+liquidator/
+├── apps/
+│   ├── hyperlend-bot/    # HyperLend liquidation bot
+│   ├── morpho-bot/       # Morpho liquidation bot
+│   └── ponder/           # Ponder indexer for Morpho Blue
+├── packages/
+│   ├── core/             # Shared utilities
+│   └── executors/        # Liquidation executor contracts
+└── pnpm-workspace.yaml
+```
+
+## Installation
+
+```bash
+pnpm install
+```
+
+## Quick Start
+
+### HyperLend Bot
+
+Run the HyperLend liquidation bot:
+```bash
+pnpm hyperlend:bot
+```
+
+Or from the app directory:
+```bash
+cd apps/hyperlend-bot
+pnpm start
+```
+
+### Deploy Contracts
+
+Deploy HyperLend executor contracts:
+```bash
+pnpm hyperlend:deploy
+```
+
+Or:
+```bash
+pnpm contracts:deploy
+```
+
+### Morpho Bot
+
+**Status: Milestone 1 Complete** ✅
+
+The Morpho bot successfully fetches whitelisted vaults from Morpho API.
+
+```bash
+pnpm morpho:bot
+```
+
+Expected output:
+```
+Found 19 whitelisted vaults
+Failed to fetch markets from Ponder (expected - Ponder setup pending)
+```
+
+See `apps/morpho-bot/README.md` for details.
+
+**Milestone 2 (Next):** Add liquidation encoding + simulation (does not require Ponder initially).
+
+### Ponder Indexer
+
+**Status: Infrastructure Ready, Initialization Pending** ⚠️
+
+Ponder infrastructure is set up (Postgres, config, schema) but Ponder 0.7 has initialization issues.
+
+**What's working:**
+- ✅ Postgres running via docker-compose
+- ✅ Configuration files ready
+- ✅ Schema defined
+
+**What's pending:**
+- ⚠️ Ponder 0.7 initialization issue (circular dependency with `@/generated`)
+
+**Available scripts:**
+- `pnpm ponder:db` - Start Postgres via docker-compose ✅
+- `pnpm ponder:db:down` - Stop Postgres ✅
+- `pnpm ponder:start` - Start Ponder indexer ⚠️ (pending fix)
+- `pnpm ponder:dev` - Start Postgres + Ponder ⚠️ (pending fix)
+
+**See:** `apps/ponder/STATUS.md` for details and resolution options.
+
+**Recommendation:** Proceed with Milestone 2 without Ponder (use direct RPC queries initially).
+
+---
+
 # HyperLend Isolated Pair Liquidator
 
 Liquidation bot for HyperLend Isolated Pairs using Core Pool flashloans and ProjectX swaps.
@@ -65,7 +162,7 @@ Liquidation bot for HyperLend Isolated Pairs using Core Pool flashloans and Proj
 
 ## Environment Variables
 
-### Bot (.env in `bot/` directory)
+### Bot (.env in `apps/hyperlend-bot/` directory)
 
 Copy `.env.example` to `.env` and fill in the values:
 
@@ -96,7 +193,7 @@ TELEGRAM_CHAT_ID=  # Telegram chat ID (leave empty if not using)
 BOT_PAUSED=false  # Set to 'true' to pause the bot (kill switch)
 ```
 
-### Contracts (.env in `contracts/` directory)
+### Contracts (.env in `packages/executors/` directory)
 
 For deployment scripts:
 
@@ -109,7 +206,12 @@ PRIVATE_KEY_MAINNET=0x...  # Private key for deployment (used by Hardhat)
 The deploy script deploys two contract instances (one for each market) in a single run:
 
 ```bash
-cd contracts
+pnpm hyperlend:deploy
+```
+
+Or from the executors directory:
+```bash
+cd packages/executors
 npx hardhat run scripts/deploy.js --network hyperEvm
 ```
 
@@ -117,14 +219,18 @@ The script will deploy:
 1. **XHYPE/USDC liquidator** using ProjectX router (fee=100)
 2. **WHLP/USDT0 liquidator** using HyperSwap Router02 (fee read from pool or default 100)
 
-Both contract addresses will be printed to the console. See `contracts/README.md` for environment variable configuration options.
+Both contract addresses will be printed to the console. See `packages/executors/README.md` for environment variable configuration options.
 
 ## Running the Bot
 
 ```bash
-cd bot
-npm install
-node src/index.js
+pnpm hyperlend:bot
+```
+
+Or from the app directory:
+```bash
+cd apps/hyperlend-bot
+pnpm start
 ```
 
 ## Rescue Script
@@ -132,8 +238,13 @@ node src/index.js
 Extract profit from contract:
 
 ```bash
-cd contracts
+cd packages/executors
 CONTRACT_ADDRESS=0x... PROFIT_RECEIVER=0x... npx hardhat run scripts/rescue.js --network hyperEvm
+```
+
+Or use the pnpm script:
+```bash
+CONTRACT_ADDRESS=0x... PROFIT_RECEIVER=0x... pnpm --filter @packages/executors hardhat:rescue
 ```
 
 ## Safety Features

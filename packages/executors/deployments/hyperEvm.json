@@ -1,0 +1,15 @@
+{
+  "network": "hyperEvm",
+  "chainId": 999,
+  "morphoExecutor": "0x8F9494F8d5385980e801CD13Cff085D36FD1E642",
+  "owner": "0xdA042130f265e594e3f8aF12E006F63BAD2349d3",
+  "deployer": "0xdA042130f265e594e3f8aF12E006F63BAD2349d3",
+  "deployedAt": "2026-01-15T13:32:17.293Z",
+  "txHash": "0xba371da1120353f39c895eb9e2a6d300975ccbc45ec9e2d95384db8a74dc1cae",
+  "morphoFlashloanExecutor": "0x98FCe9e656DBc832B2e2392a3fE188f7518CC234",
+  "morphoBlue": "0x68e37dE8d93d3496ae143F2E900490f6280C57cD",
+  "flashloanExecutorOwner": "0xdA042130f265e594e3f8aF12E006F63BAD2349d3",
+  "flashloanExecutorDeployer": "0xdA042130f265e594e3f8aF12E006F63BAD2349d3",
+  "flashloanExecutorDeployedAt": "2026-01-15T15:27:59.587Z",
+  "flashloanExecutorTxHash": "0xeef52edfc4b19eef60e6a8a7b831f250e0bef1c9be29d928efda7813eb1eff35"
+}

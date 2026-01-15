@@ -1,0 +1,16 @@
+# Ponder generated files
+.ponder/
+
+# Environment files
+.env
+.env.local
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+ponder.log
+
+# OS files
+.DS_Store
