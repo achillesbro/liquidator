@@ -62,14 +62,26 @@ function encodeTransfer(tokenAddress, to, amount) {
 
 /**
  * Encode Morpho Blue liquidation call
+ * 
+ * IMPORTANT: Morpho Blue's liquidate() requires specifying EITHER:
+ * - seizedAssets > 0 and repaidShares = 0 (specify collateral to seize)
+ * - seizedAssets = 0 and repaidShares > 0 (specify debt to repay)
+ * 
+ * Passing both non-zero will cause a revert!
+ * 
+ * We use seizedAssets mode because we know exactly how much collateral
+ * we want to seize and swap.
+ * 
  * @param {string} morphoBlueAddress - Morpho Blue contract address
  * @param {Object} marketParams - Market parameters
  * @param {string} borrower - Borrower address
- * @param {bigint} seizedAssets - Amount of collateral to seize
- * @param {bigint} repaidShares - Amount of debt shares to repay
+ * @param {bigint} seizedAssets - Amount of collateral to seize (use this OR repaidShares, not both)
+ * @param {bigint} repaidShares - Amount of debt shares to repay (set to 0 when using seizedAssets)
  * @returns {Object} Call object {target, value, data}
  */
-function encodeLiquidation(morphoBlueAddress, marketParams, borrower, seizedAssets, repaidShares) {
+function encodeLiquidation(morphoBlueAddress, marketParams, borrower, seizedAssets, repaidShares = 0n) {
+  // Morpho Blue requires exactly one of seizedAssets or repaidShares to be non-zero
+  // We default to seizedAssets mode for predictable collateral acquisition
   const data = encodeFunctionData({
     abi: MORPHO_BLUE_ABI,
     functionName: 'liquidate',
@@ -77,7 +89,7 @@ function encodeLiquidation(morphoBlueAddress, marketParams, borrower, seizedAsse
       marketParams,
       borrower,
       seizedAssets,
-      repaidShares,
+      0n, // Always pass 0 for repaidShares when specifying seizedAssets
       '0x', // Empty data for now
     ],
   });
@@ -122,12 +134,12 @@ function buildLiquidationPlan(config, liquidation, route) {
   ));
   
   // Step 2: Execute liquidation on Morpho Blue
+  // Note: We specify seizedAssets only (repaidShares = 0), Morpho calculates debt to repay
   calls.push(encodeLiquidation(
     config.morphoBlueAddress,
     liquidation.marketParams,
     liquidation.user,
-    liquidation.seizeAssets,
-    liquidation.repayShares
+    liquidation.seizeAssets
   ));
   
   // Step 3: Approve router to spend seized collateral
@@ -164,21 +176,22 @@ function buildCallsForExecutor(config, liquidation, route) {
   const { loanToken, collateralToken } = liquidation.marketParams;
   
   // Step 1: Approve Morpho Blue to spend loan token (for repayment)
-  // Use exact amount to minimize approval exposure
+  // Add 1% buffer since Morpho calculates exact repay amount internally based on seizedAssets
+  const approvalAmount = liquidation.repayAssets + (liquidation.repayAssets / 100n);
   calls.push({
-    ...encodeApproval(loanToken, config.morphoBlueAddress, liquidation.repayAssets),
-    description: `Approve Morpho to spend ${liquidation.repayAssets} ${liquidation.loanSymbol}`,
+    ...encodeApproval(loanToken, config.morphoBlueAddress, approvalAmount),
+    description: `Approve Morpho to spend ${approvalAmount} ${liquidation.loanSymbol}`,
   });
   
   // Step 2: Execute liquidation on Morpho Blue
   // This will transfer repayAssets from executor to Morpho, receive seizeAssets collateral
+  // Note: We specify seizedAssets only (repaidShares = 0), Morpho calculates debt to repay
   calls.push({
     ...encodeLiquidation(
       config.morphoBlueAddress,
       liquidation.marketParams,
       liquidation.user,
-      liquidation.seizeAssets,
-      liquidation.repayShares
+      liquidation.seizeAssets
     ),
     description: `Liquidate ${liquidation.user.slice(0, 10)}... seize ${liquidation.seizeAssets} ${liquidation.collateralSymbol}`,
   });
@@ -347,20 +360,22 @@ function buildCallsForFlashloan(config, liquidation, route) {
   
   // Step 1: Approve Morpho Blue to spend loan token (for liquidation repayment)
   // This is the approval for the liquidate() call to pull repayAssets
+  // Add 1% buffer since Morpho calculates exact repay amount internally based on seizedAssets
+  const approvalAmount = liquidation.repayAssets + (liquidation.repayAssets / 100n);
   calls.push({
-    ...encodeApproval(loanToken, config.morphoBlueAddress, liquidation.repayAssets),
-    description: `Approve Morpho to spend ${liquidation.repayAssets} ${liquidation.loanSymbol} for liquidation`,
+    ...encodeApproval(loanToken, config.morphoBlueAddress, approvalAmount),
+    description: `Approve Morpho to spend ${approvalAmount} ${liquidation.loanSymbol} for liquidation`,
   });
   
   // Step 2: Execute liquidation on Morpho Blue
-  // This pulls repayAssets from executor, gives seizeAssets collateral
+  // This pulls loan tokens from executor, gives seizeAssets collateral
+  // Note: We specify seizedAssets only (repaidShares = 0), Morpho calculates debt to repay
   calls.push({
     ...encodeLiquidation(
       config.morphoBlueAddress,
       liquidation.marketParams,
       liquidation.user,
-      liquidation.seizeAssets,
-      liquidation.repayShares
+      liquidation.seizeAssets
     ),
     description: `Liquidate ${liquidation.user.slice(0, 10)}... seize ${liquidation.seizeAssets} ${liquidation.collateralSymbol}`,
   });

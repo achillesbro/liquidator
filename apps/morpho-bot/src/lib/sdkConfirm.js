@@ -311,9 +311,10 @@ async function confirmLiquidatable(client, morphoBlueAddress, candidate, config 
     const repayAssets = (repayShares * totalBorrowAssets) / totalBorrowShares;
     
     // Seizable collateral = repayAssets * (1 + incentive) / price
+    // To convert loan tokens to collateral: collateral = loanTokens * ORACLE_PRICE_SCALE / oraclePrice
     const repayValue = repayAssets;
     const seizeValue = repayValue + (repayValue * liquidationIncentive) / (10n ** 18n);
-    const seizeAssets = (seizeValue * (10n ** 18n)) / oraclePrice;
+    const seizeAssets = (seizeValue * ORACLE_PRICE_SCALE) / oraclePrice;
     
     // Cap seize amount to available collateral
     const finalSeizeAssets = seizeAssets > collateral ? collateral : seizeAssets;

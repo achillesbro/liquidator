@@ -9,7 +9,10 @@
     "execute": "EXECUTION_ENABLED=1 node src/index.js",
     "test:flow": "node src/scripts/test-execution-flow.js",
     "test:tx": "node src/scripts/test-tx-submission.js",
-    "test:swap": "node src/scripts/test-liquidswap.js"
+    "test:swap": "node src/scripts/test-liquidswap.js",
+    "test:flashloan-noop": "node src/scripts/test-flashloan-noop.js",
+    "test:liquidswap-swap": "node src/scripts/test-liquidswap-swap.js",
+    "test:flashloan-swap": "node src/scripts/test-flashloan-swap.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -18,6 +21,7 @@
     "@morpho-org/blue-sdk": "^1.0.0",
     "@morpho-org/blue-sdk-viem": "^1.0.0",
     "@morpho-org/liquidation-sdk-viem": "^1.0.0",
+    "dotenv": "^16.4.5",
     "viem": "^2.21.0"
   },
   "devDependencies": {}

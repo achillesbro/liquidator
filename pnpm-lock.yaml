@@ -40,6 +40,9 @@ importers:
       '@morpho-org/liquidation-sdk-viem':
         specifier: ^1.0.0
         version: 1.12.4(@morpho-org/blue-api-sdk@1.12.7)(@morpho-org/blue-sdk@1.12.7)(@morpho-org/morpho-ts@1.12.7)(evm-maths@7.0.1)(viem@2.44.2)
+      dotenv:
+        specifier: ^16.4.5
+        version: 16.6.1
       viem:
         specifier: ^2.21.0
         version: 2.44.2
