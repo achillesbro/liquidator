@@ -402,7 +402,24 @@ async function simulateFlashloanCall(publicClient, plan, config) {
       ],
     });
     
-    // Simulate the flashloan call
+    // First, try raw eth_call to get full revert data if it fails
+    let rawCallResult;
+    try {
+      rawCallResult = await publicClient.call({
+        to: executorAddress,
+        data: calldata,
+        account: account.address,
+      });
+    } catch (callError) {
+      // eth_call failed - extract the full revert data
+      const revertData = callError.cause?.data || callError.data;
+      if (revertData) {
+        throw { rawRevertData: revertData, originalError: callError };
+      }
+      throw callError;
+    }
+    
+    // If eth_call succeeded, do full simulation for gas estimate
     const result = await publicClient.simulateContract({
       address: executorAddress,
       abi: FLASHLOAN_EXECUTOR_ABI,
@@ -442,13 +459,79 @@ async function simulateFlashloanCall(publicClient, plan, config) {
     };
     
   } catch (error) {
-    // Parse revert reason if available
-    let revertReason = error.message;
-    if (error.cause?.data) {
-      revertReason = error.cause.data;
+    // Check if we have raw revert data from our eth_call attempt
+    let rawData = error.rawRevertData;
+    let revertReason = error.originalError?.shortMessage || error.shortMessage || error.message;
+    
+    // Debug output
+    console.log(`    [DEBUG] rawRevertData: ${rawData?.slice(0, 200)}`);
+    
+    if (!rawData) {
+      // Fallback: try to find raw data from viem error structure
+      rawData = error.cause?.data || error.data || error.cause?.cause?.data;
+      console.log(`    [DEBUG] fallback rawData: ${rawData?.slice(0, 200)}`);
     }
-    if (error.shortMessage) {
-      revertReason = error.shortMessage;
+    
+    // Try to decode CallFailed error (0x5c0dee5d)
+    if (rawData && typeof rawData === 'string' && rawData.length > 10) {
+      const callFailedSelector = '5c0dee5d';
+      const rawLower = rawData.toLowerCase();
+      
+      if (rawLower.includes(callFailedSelector)) {
+        try {
+          // Find where the selector starts
+          const selectorPos = rawLower.indexOf(callFailedSelector);
+          const dataStart = selectorPos + 8; // Skip the 8 char selector
+          const data = rawData.slice(dataStart);
+          
+          console.log(`    [DEBUG] CallFailed payload length: ${data.length}`);
+          
+          if (data.length >= 64) {
+            // First 32 bytes (64 hex chars) = index
+            const indexHex = data.slice(0, 64);
+            const callIndex = parseInt(indexHex, 16);
+            
+            const callNames = ['Approve Morpho', 'Liquidate', 'Approve Router', 'Swap'];
+            const callName = callNames[callIndex] || `Unknown`;
+            
+            // Try to extract nested reason
+            let nestedReason = '';
+            if (data.length > 128) {
+              try {
+                // Offset to bytes data (next 32 bytes)
+                const offsetHex = data.slice(64, 128);
+                const offset = parseInt(offsetHex, 16) * 2;
+                
+                if (data.length > offset + 64) {
+                  // Length of bytes (32 bytes at offset)
+                  const lengthHex = data.slice(offset, offset + 64);
+                  const length = parseInt(lengthHex, 16) * 2;
+                  
+                  // The actual bytes data
+                  const reasonHex = data.slice(offset + 64, offset + 64 + Math.min(length, 500));
+                  if (reasonHex.length > 0) {
+                    // Try to decode as Error(string) if it starts with 08c379a0
+                    if (reasonHex.toLowerCase().startsWith('08c379a0') && reasonHex.length >= 136) {
+                      const strLength = parseInt(reasonHex.slice(72, 136), 16) * 2;
+                      const strHex = reasonHex.slice(136, 136 + Math.min(strLength, 200));
+                      const decoded = Buffer.from(strHex, 'hex').toString('utf8').replace(/\0/g, '');
+                      nestedReason = `: "${decoded}"`;
+                    } else {
+                      nestedReason = `: 0x${reasonHex.slice(0, 64)}${reasonHex.length > 64 ? '...' : ''}`;
+                    }
+                  }
+                }
+              } catch (e) {
+                console.log(`    [DEBUG] Nested decode error: ${e.message}`);
+              }
+            }
+            
+            revertReason = `CallFailed at step ${callIndex} [${callName}]${nestedReason}`;
+          }
+        } catch (decodeError) {
+          console.log(`    [DEBUG] CallFailed decode error: ${decodeError.message}`);
+        }
+      }
     }
     
     return {

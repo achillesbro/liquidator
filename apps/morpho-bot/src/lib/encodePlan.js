@@ -358,10 +358,17 @@ function buildCallsForFlashloan(config, liquidation, route) {
   
   const { loanToken, collateralToken } = liquidation.marketParams;
   
+  // Calculate flashloan amount first (needed for approval)
+  const flashloanAssets = calculateFlashloanAmount(
+    liquidation.repayAssets,
+    config.flashloanBufferBps,
+    config.maxFlashloanAssets
+  );
+  
   // Step 1: Approve Morpho Blue to spend loan token (for liquidation repayment)
-  // This is the approval for the liquidate() call to pull repayAssets
-  // Add 1% buffer since Morpho calculates exact repay amount internally based on seizedAssets
-  const approvalAmount = liquidation.repayAssets + (liquidation.repayAssets / 100n);
+  // Approve the full flashloan amount to handle interest accrual and rounding
+  // Morpho calculates exact repay amount internally based on seizedAssets
+  const approvalAmount = flashloanAssets;
   calls.push({
     ...encodeApproval(loanToken, config.morphoBlueAddress, approvalAmount),
     description: `Approve Morpho to spend ${approvalAmount} ${liquidation.loanSymbol} for liquidation`,
@@ -399,13 +406,6 @@ function buildCallsForFlashloan(config, liquidation, route) {
   // - Approving Morpho to pull flashloan repayment
   // - Transferring profit to treasury
   // - Validating minimum profit
-  
-  // Calculate flashloan amount with buffer
-  const flashloanAssets = calculateFlashloanAmount(
-    liquidation.repayAssets,
-    config.flashloanBufferBps,
-    config.maxFlashloanAssets
-  );
   
   // Estimate profit (before gas)
   const estimatedSwapOut = route ? route.expectedOut : 0n;

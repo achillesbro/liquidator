@@ -102,7 +102,13 @@ function getConfig() {
     
     // Flashloan mode (Milestone 4)
     flashloanExecutorAddress: process.env.FLASHLOAN_EXECUTOR_ADDRESS_999 || '',
-    flashloanBufferBps: parseInt(process.env.FLASHLOAN_BUFFER_BPS || '20', 10), // 0.2% buffer
+    // Flashloan buffer: must be large enough to cover interest accrual during liquidation
+    // Default 100% buffer (double repay amount) to handle deeply underwater positions
+    // Morpho's liquidation math can require more than the calculated repay due to:
+    // - Interest accrual during the liquidate call
+    // - Rounding in share/asset conversions
+    // - Bad debt scenarios where collateral < debt
+    flashloanBufferBps: parseInt(process.env.FLASHLOAN_BUFFER_BPS || '10000', 10), // 100% buffer
     maxFlashloanAssets: process.env.MAX_FLASHLOAN_ASSETS 
       ? BigInt(process.env.MAX_FLASHLOAN_ASSETS) 
       : null, // null = no cap
@@ -150,6 +156,44 @@ function getConfig() {
     
     // Bad debt handling
     allowBadDebt: process.env.ALLOW_BAD_DEBT === 'true',
+    
+    // Testing: allow unprofitable liquidations (for testing plumbing)
+    allowUnprofitable: process.env.ALLOW_UNPROFITABLE === '1' || process.env.ALLOW_UNPROFITABLE === 'true',
+    
+    // Minimum repay amount filter (skip dust positions)
+    // Default: 1 USD worth (assuming 6 decimals for most stables)
+    minRepayAssets: process.env.MIN_REPAY_ASSETS 
+      ? BigInt(process.env.MIN_REPAY_ASSETS)
+      : 1000000n, // 1 USDC/USDT (6 decimals)
+    
+    // Seize buffer: reduce seizeAssets by this % to avoid rounding/timing issues
+    // Default: 5 bps (0.05%) - small enough to not lose much, large enough to handle drift
+    seizeBufferBps: parseInt(process.env.SEIZE_BUFFER_BPS || '5', 10),
+    
+    // Scheduler configuration
+    tickBaseSeconds: parseInt(process.env.TICK_BASE_SECONDS || '30', 10),
+    tickFastSeconds: parseInt(process.env.TICK_FAST_SECONDS || '10', 10),
+    jitterPct: parseInt(process.env.JITTER_PCT || '10', 10),
+    fastModeMinutes: parseInt(process.env.FAST_MODE_MINUTES || '5', 10),
+    
+    // Cache TTLs (in minutes)
+    vaultsTtlMinutes: parseInt(process.env.VAULTS_TTL_MINUTES || '30', 10),
+    marketsTtlMinutes: parseInt(process.env.MARKETS_TTL_MINUTES || '15', 10),
+    candidatesTtlSeconds: parseInt(process.env.CANDIDATES_TTL_SECONDS || '20', 10),
+    
+    // Per-tick caps
+    candidatesPerTick: parseInt(process.env.CANDIDATES_PER_TICK || '400', 10),
+    maxConfirmationsPerTick: parseInt(process.env.MAX_CONFIRMATIONS_PER_TICK || '200', 10),
+    maxSimulationsPerTick: parseInt(process.env.MAX_SIMULATIONS_PER_TICK || '75', 10),
+    maxTxPerTick: parseInt(process.env.MAX_TX_PER_TICK || '2', 10),
+    
+    // Cooldown durations (in minutes)
+    solventCooldownMinutes: parseInt(process.env.SOLVENT_COOLDOWN_MINUTES || '30', 10),
+    failCooldownMinutes: parseInt(process.env.FAIL_COOLDOWN_MINUTES || '60', 10),
+    execFailCooldownMinutes: parseInt(process.env.EXEC_FAIL_COOLDOWN_MINUTES || '120', 10),
+    
+    // Run mode
+    runOnce: parseInt(process.env.RUN_ONCE || '0', 10) === 1,
   };
   
   // Validate if execution is enabled

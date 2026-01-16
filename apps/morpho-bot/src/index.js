@@ -7,6 +7,8 @@
  * Supports two execution modes:
  * - prefund: Uses pre-funded executor (Milestone 3)
  * - flashloan: Uses Morpho flashloan for atomic execution (Milestone 4)
+ * 
+ * Now includes scheduler with adaptive cadence, caching, and backlog management.
  */
 
 const { formatUnits } = require('viem');
@@ -17,28 +19,20 @@ const { createClient, batchConfirm } = require('./lib/sdkConfirm');
 const { fetchSwapRoute } = require('./lib/routeLiquidSwap');
 const { 
   buildLiquidationPlan, 
-  buildCallsForExecutor, 
-  buildCallsForFlashloan,
   buildExecutionPlan,
-  checkExecutorBalance 
 } = require('./lib/encodePlan');
 const { batchSimulate, isProfitable } = require('./lib/simulate');
 const {
   createExecutionClients,
   verifyExecutorOwnership,
   verifyFlashloanExecutor,
-  simulateExecutorCall,
-  simulateFlashloanCall,
   dispatchSimulation,
-  executeViaExecutor,
-  executeViaFlashloan,
   dispatchExecution,
   calculateActualProfit,
-  formatExecutionResult,
 } = require('./lib/execute');
 const {
   isBotPaused,
-  checkCooldown,
+  checkCooldownByType,
   addToCooldown,
   clearCooldown,
   checkRepayCap,
@@ -46,8 +40,10 @@ const {
   sendTelegramNotification,
   formatSuccessNotification,
   formatFailureNotification,
-  RunStats,
 } = require('./lib/operations');
+const cache = require('./lib/cache');
+const { CandidateBacklog } = require('./lib/backlog');
+const { Scheduler } = require('./lib/scheduler');
 
 /**
  * Format bigint for display
@@ -64,450 +60,463 @@ function formatAmount(amount, decimals = 18) {
 }
 
 /**
- * Print liquidation details
+ * Print startup banner
  */
-function printLiquidations(simulations, maxPrint = 50) {
-  if (simulations.length === 0) {
-    console.log('\n✓ No liquidatable positions found.');
-    return;
+function printStartupBanner(config) {
+  const mode = config.executionEnabled ? 'EXECUTION' : 'SIMULATION';
+  const execMode = config.executionMode.toUpperCase();
+  
+  console.log('\n' + '='.repeat(70));
+  console.log(`Morpho Bot - Milestone 4 - ${mode} MODE (${execMode})`);
+  console.log('='.repeat(70));
+  console.log(`Chain ID: ${config.chainId}`);
+  console.log(`RPC URL: ${config.rpcUrl}`);
+  console.log(`Morpho API: ${config.morphoApiUrl}`);
+  console.log(`Execution Enabled: ${config.executionEnabled}`);
+  console.log(`Execution Mode: ${config.executionMode}`);
+  console.log(`Baseline Cadence: ${config.tickBaseSeconds}s`);
+  console.log(`Fast Mode Cadence: ${config.tickFastSeconds}s`);
+  console.log(`Jitter: ±${config.jitterPct}%`);
+  console.log(`Candidates Per Tick: ${config.candidatesPerTick}`);
+  console.log(`Max Confirmations Per Tick: ${config.maxConfirmationsPerTick}`);
+  console.log(`Max Simulations Per Tick: ${config.maxSimulationsPerTick}`);
+  console.log(`Max TX Per Tick: ${config.maxTxPerTick}`);
+  console.log(`Slippage: ${config.slippageBps} bps`);
+  console.log(`Min Repay: ${config.minRepayAssets} (raw)`);
+  if (config.allowUnprofitable) {
+    console.log(`⚠️  ALLOW_UNPROFITABLE=1 (testing mode)`);
   }
   
-  console.log('\nLiquidatable Positions (Simulated):');
-  console.log('-'.repeat(70));
-  
-  const toPrint = simulations.slice(0, maxPrint);
-  
-  toPrint.forEach((sim, idx) => {
-    const { liquidation, route, planValid, profitEstimate } = sim;
-    const status = planValid ? '✓' : '✗';
-    const profitStr = profitEstimate && profitEstimate.grossProfit > 0n
-      ? `+${formatAmount(profitEstimate.grossProfit, liquidation.loanDecimals)} ${liquidation.loanSymbol}`
-      : 'N/A';
+  if (config.executionEnabled) {
+    const activeExecutor = getActiveExecutorAddress(config);
+    console.log(`Executor: ${activeExecutor}`);
+    console.log(`Treasury: ${config.treasuryAddress}`);
     
-    console.log(`[${idx + 1}] ${status} Market: ${liquidation.marketId.slice(0, 10)}...`);
-    console.log(`    User: ${liquidation.user}`);
-    console.log(`    Pair: ${liquidation.collateralSymbol} → ${liquidation.loanSymbol}`);
-    console.log(`    Repay: ${formatAmount(liquidation.repayAssets, liquidation.loanDecimals)} ${liquidation.loanSymbol}`);
-    console.log(`    Seize: ${formatAmount(liquidation.seizeAssets, liquidation.collateralDecimals)} ${liquidation.collateralSymbol}`);
-    if (route) {
-      console.log(`    Swap out: ${formatAmount(route.expectedOut, liquidation.loanDecimals)} ${liquidation.loanSymbol}`);
+    if (config.executionMode === 'flashloan') {
+      console.log(`Flashloan Buffer: ${config.flashloanBufferBps} bps`);
+      if (config.maxFlashloanAssets) {
+        console.log(`Max Flashloan: ${config.maxFlashloanAssets}`);
+      }
+      if (config.minFlashloanProfit > 0n) {
+        console.log(`Min Flashloan Profit: ${config.minFlashloanProfit}`);
+      }
     }
-    console.log(`    Estimated profit: ${profitStr}`);
-    console.log(`    Gas estimate: ${sim.totalGasEstimate?.toLocaleString() || 'N/A'}`);
-    console.log('');
-  });
-  
-  if (simulations.length > maxPrint) {
-    console.log(`(+${simulations.length - maxPrint} more positions not shown)`);
   }
   
-  console.log('-'.repeat(70));
+  if (config.testMode) {
+    console.log(`\n🧪 TEST MODE ENABLED: LLTV multiplier = ${config.testLltvMultiplier * 100}%`);
+  }
+  
+  console.log('='.repeat(70));
 }
 
 /**
- * Main entry point
+ * Run a single tick - the main processing pipeline
+ * @param {Object} ctx - Context object with config, executionClients, backlog
+ * @returns {Promise<Object>} Tick metrics
  */
-async function main() {
-  const startTime = Date.now();
-  const stats = new RunStats();
-  
+async function runTick(ctx) {
+  const { config, executionClients, backlog } = ctx;
+  const metrics = {
+    fetchedVaults: 0,
+    fetchedMarkets: 0,
+    fetchedCandidates: 0,
+    confirmedCount: 0,
+    liquidatableCount: 0,
+    simulatedCount: 0,
+    simSuccessCount: 0,
+    profitOkCount: 0,
+    executedCount: 0,
+    execSuccessCount: 0,
+    errorsCount: 0,
+    triggers: {
+      hasLiquidatable: false,
+      hasExec: false,
+      hasNearMiss: false,
+    },
+  };
+
   try {
-    // Load configuration
-    const config = getConfig();
-    
-    // Check kill switch
-    if (isBotPaused(config)) {
-      console.log('\n⏸ Bot is PAUSED (BOT_PAUSED=true). Exiting.');
-      process.exit(0);
-    }
-    
-    const mode = config.executionEnabled ? 'EXECUTION' : 'SIMULATION';
-    const execMode = config.executionMode.toUpperCase();
-    console.log('\n' + '='.repeat(70));
-    console.log(`Morpho Bot - Milestone 4 - ${mode} MODE (${execMode})`);
-    console.log('='.repeat(70));
-    console.log(`Chain ID: ${config.chainId}`);
-    console.log(`RPC URL: ${config.rpcUrl}`);
-    console.log(`Morpho API: ${config.morphoApiUrl}`);
-    console.log(`Execution Enabled: ${config.executionEnabled}`);
-    console.log(`Execution Mode: ${config.executionMode}`);
-    console.log(`Max Candidates: ${config.maxCandidates}`);
-    console.log(`Max Simulations: ${config.maxSimulations}`);
-    console.log(`Max TX Per Run: ${config.maxTxPerRun}`);
-    console.log(`Slippage: ${config.slippageBps} bps`);
-    console.log(`Cooldown: ${config.cooldownMinutes} minutes`);
-    
-    if (config.executionEnabled) {
-      const activeExecutor = getActiveExecutorAddress(config);
-      console.log(`Executor: ${activeExecutor}`);
-      console.log(`Treasury: ${config.treasuryAddress}`);
-      
-      if (config.executionMode === 'flashloan') {
-        console.log(`Flashloan Buffer: ${config.flashloanBufferBps} bps`);
-        if (config.maxFlashloanAssets) {
-          console.log(`Max Flashloan: ${config.maxFlashloanAssets}`);
-        }
-        if (config.minFlashloanProfit > 0n) {
-          console.log(`Min Flashloan Profit: ${config.minFlashloanProfit}`);
-        }
+    const isPaused = isBotPaused(config);
+
+    // Step 1: Fetch whitelisted vaults (cached)
+    const vaults = await cache.getOrSet(
+      `vaults:${config.chainId}`,
+      config.vaultsTtlMinutes * 60 * 1000,
+      async () => {
+        return await fetchWhitelistedVaults(config.morphoApiUrl, config.chainId);
       }
-    }
-    
-    if (config.testMode) {
-      console.log(`\n🧪 TEST MODE ENABLED: LLTV multiplier = ${config.testLltvMultiplier * 100}%`);
-    }
-    
-    // Initialize execution clients if needed
-    let executionClients = null;
-    if (config.executionEnabled) {
-      console.log('\nInitializing execution clients...');
-      executionClients = createExecutionClients(config);
-      
-      const activeExecutor = getActiveExecutorAddress(config);
-      
-      if (config.executionMode === 'flashloan') {
-        // Verify flashloan executor
-        const verification = await verifyFlashloanExecutor(
-          executionClients.publicClient,
-          activeExecutor,
-          executionClients.account.address,
-          config.morphoBlueAddress
-        );
-        
-        if (!verification.valid) {
-          console.error(`\n❌ Flashloan executor verification failed:`);
-          verification.errors.forEach(e => console.error(`  - ${e}`));
-          process.exit(1);
-        }
-        console.log(`✓ Flashloan executor verified. Owner: ${verification.owner}, Morpho: ${verification.morpho}`);
-      } else {
-        // Verify prefund executor ownership
-        const isOwner = await verifyExecutorOwnership(
-          executionClients.publicClient,
-          activeExecutor,
-          executionClients.account.address
-        );
-        
-        if (!isOwner) {
-          console.error(`\n❌ Bot account ${executionClients.account.address} is not owner of executor ${activeExecutor}`);
-          process.exit(1);
-        }
-        console.log(`✓ Executor ownership verified. Bot: ${executionClients.account.address}`);
-      }
-    }
-    
-    // Step 1: Fetch whitelisted vaults
-    console.log('\n[1/8] Fetching whitelisted vaults from Morpho API...');
-    const vaults = await fetchWhitelistedVaults(config.morphoApiUrl, config.chainId);
-    console.log(`✓ Found ${vaults.length} whitelisted vaults`);
-    
-    if (vaults.length === 0) {
-      console.log('\n✓ No whitelisted vaults found. Exiting.');
-      stats.printSummary(config);
-      return;
-    }
-    
-    const vaultAddresses = vaults.map(v => v.address);
-    
-    // Step 2: Fetch markets for vaults
-    console.log('\n[2/8] Fetching markets from Morpho API...');
-    const markets = await fetchMarketsForVaults(config.morphoApiUrl, config.chainId, vaultAddresses);
-    console.log(`✓ Found ${markets.length} unique markets`);
-    
-    if (markets.length === 0) {
-      console.log('\n✓ No markets found. Exiting.');
-      stats.printSummary(config);
-      return;
-    }
-    
-    const marketIds = markets.map(m => m.id);
-    
-    // Step 3: Fetch candidate positions
-    console.log('\n[3/8] Fetching candidate positions from Morpho API...');
-    const candidates = await fetchCandidatePositions(
-      config.morphoApiUrl,
-      config.chainId,
-      marketIds,
-      config.maxCandidates
     );
-    stats.candidates = candidates.length;
-    console.log(`✓ Found ${candidates.length} candidate positions`);
-    
-    if (candidates.length === 0) {
-      console.log('\n✓ No candidates found. Exiting.');
-      stats.printSummary(config);
-      return;
+    metrics.fetchedVaults = vaults.length;
+
+    if (vaults.length === 0) {
+      return metrics;
     }
-    
-    // Step 4: Confirm liquidatable positions onchain
-    console.log(`\n[4/8] Confirming ${config.testMode ? 'at-risk' : 'liquidatable'} positions onchain...`);
+
+    const vaultAddresses = vaults.map(v => v.address);
+
+    // Step 2: Fetch markets (cached)
+    const markets = await cache.getOrSet(
+      `markets:${config.chainId}:${vaultAddresses.join(',')}`,
+      config.marketsTtlMinutes * 60 * 1000,
+      async () => {
+        return await fetchMarketsForVaults(config.morphoApiUrl, config.chainId, vaultAddresses);
+      }
+    );
+    metrics.fetchedMarkets = markets.length;
+
+    if (markets.length === 0) {
+      return metrics;
+    }
+
+    const marketIds = markets.map(m => m.id);
+
+    // Step 3: Get candidates from backlog (refill if needed)
+    const candidatesToFetch = Math.min(
+      config.candidatesPerTick,
+      config.candidatesPerTick - backlog.queue.length
+    );
+
+    if (candidatesToFetch > 0 || backlog.shouldRefetch()) {
+      const fetched = await backlog.refillIfLow(
+        async (targetSize) => {
+          return await fetchCandidatePositions(
+            config.morphoApiUrl,
+            config.chainId,
+            marketIds,
+            targetSize
+          );
+        },
+        Math.floor(config.candidatesPerTick * 0.5), // Refill when below 50%
+        config.candidatesPerTick
+      );
+      metrics.fetchedCandidates = fetched;
+    }
+
+    // Get batch from backlog (respecting cooldowns)
+    const candidates = backlog.getBatch(config.candidatesPerTick, {
+      solventCooldownMinutes: config.solventCooldownMinutes,
+      failCooldownMinutes: config.failCooldownMinutes,
+      execFailCooldownMinutes: config.execFailCooldownMinutes,
+    });
+
+    if (candidates.length === 0) {
+      return metrics;
+    }
+
+    // Step 4: Confirm liquidatable positions (capped)
+    const candidatesToConfirm = candidates.slice(0, config.maxConfirmationsPerTick);
     const confirmed = await batchConfirm(
       config.rpcUrl,
       config.morphoBlueAddress,
-      candidates,
-      config.maxSimulations,
+      candidatesToConfirm,
+      config.maxConfirmationsPerTick,
       config
     );
-    stats.confirmed = confirmed.length;
-    console.log(`✓ Confirmed ${confirmed.length} ${config.testMode ? 'at-risk' : 'liquidatable'} positions`);
-    
-    if (confirmed.length === 0) {
-      console.log('\n✓ No confirmed liquidatable positions. Exiting.');
-      stats.printSummary(config);
-      return;
-    }
-    
-    // Step 5: Filter by cooldown and caps
-    console.log('\n[5/8] Applying operational filters...');
+    metrics.confirmedCount = confirmed.length;
+
+    // Sort confirmed by repayAssets descending (largest first = most profitable)
+    confirmed.sort((a, b) => {
+      const aRepay = a.repayAssets || 0n;
+      const bRepay = b.repayAssets || 0n;
+      if (bRepay > aRepay) return 1;
+      if (bRepay < aRepay) return -1;
+      return 0;
+    });
+
+    // Filter confirmed by cooldown, caps, and dust threshold
     const filtered = [];
+    let skippedCooldown = 0;
+    let skippedCap = 0;
+    let skippedDust = 0;
+    
+    console.log(`\n[Filter] Filtering ${confirmed.length} confirmed positions (sorted by size desc)...`);
     
     for (const liquidation of confirmed) {
-      // Check cooldown
-      const cooldownCheck = checkCooldown(
+      const pair = `${liquidation.collateralSymbol}→${liquidation.loanSymbol}`;
+      const userShort = liquidation.user;
+      
+      // Check cooldown with type-specific durations
+      const cooldownCheck = checkCooldownByType(
         liquidation.marketId,
         liquidation.user,
-        config.cooldownMinutes
+        {
+          solventCooldownMinutes: config.solventCooldownMinutes,
+          failCooldownMinutes: config.failCooldownMinutes,
+          execFailCooldownMinutes: config.execFailCooldownMinutes,
+        }
       );
+
       if (cooldownCheck.inCooldown) {
-        console.log(`  [COOLDOWN] ${liquidation.user.slice(0, 10)}... (${cooldownCheck.remainingMinutes}m remaining)`);
-        stats.skippedCooldown++;
+        console.log(`  [COOLDOWN] ${userShort} ${pair}: ${cooldownCheck.remainingMinutes}m remaining (${cooldownCheck.reason})`);
+        skippedCooldown++;
         continue;
       }
-      
-      // Check repay cap
+
+      // Check repay cap (max)
       const capCheck = checkRepayCap(liquidation.repayAssets, config.maxRepayLoanAssets);
       if (capCheck.exceeds) {
-        console.log(`  [CAP] ${liquidation.user.slice(0, 10)}... repay ${capCheck.original} > cap ${capCheck.capped}`);
-        stats.skippedCap++;
+        console.log(`  [CAP] ${userShort} ${pair}: repay exceeds cap`);
+        skippedCap++;
         continue;
       }
-      
+
+      // Check dust threshold (min) - skip positions too small to be profitable
+      if (config.minRepayAssets && liquidation.repayAssets < config.minRepayAssets) {
+        console.log(`  [DUST] ${userShort} ${pair}: repay=${formatAmount(liquidation.repayAssets, liquidation.loanDecimals)} < min ${formatAmount(config.minRepayAssets, liquidation.loanDecimals)}`);
+        skippedDust++;
+        // Add to cooldown so we don't keep checking it
+        addToCooldown(liquidation.marketId, liquidation.user, 'Dust position', 'solvent');
+        continue;
+      }
+
+      console.log(`  [PASS] ${userShort} ${pair}: repay=${formatAmount(liquidation.repayAssets, liquidation.loanDecimals)} seize=${formatAmount(liquidation.seizeAssets, liquidation.collateralDecimals)}`);
       filtered.push(liquidation);
     }
-    
-    console.log(`✓ ${filtered.length} positions passed filters`);
-    
+
+    console.log(`[Filter] Summary: ${filtered.length} passed, ${skippedCooldown} cooldown, ${skippedCap} cap, ${skippedDust} dust`);
+
+    metrics.liquidatableCount = filtered.length;
+
     if (filtered.length === 0) {
-      console.log('\n✓ All positions filtered. Exiting.');
-      stats.printSummary(config);
-      return;
+      return metrics;
     }
-    
-    // Step 6: Fetch swap routes
-    console.log('\n[6/8] Fetching swap routes from LiquidSwap...');
-    console.log(`  Processing ${filtered.length} positions...`);
-    const plans = [];
-    let routeErrors = 0;
-    let skippedNoRoute = 0;
-    
-    // Determine recipient based on mode
+
+    // Step 5: Fetch swap routes
     const activeExecutor = config.executionEnabled 
       ? getActiveExecutorAddress(config) 
       : config.morphoBlueAddress;
-    
-    for (let i = 0; i < filtered.length; i++) {
-      const liquidation = filtered[i];
-      let route = null;
-      
-      // Progress indicator every 10 positions
-      if ((i + 1) % 10 === 0 || i === filtered.length - 1) {
-        process.stdout.write(`\r  Progress: ${i + 1}/${filtered.length} (${stats.routesFound} routes, ${routeErrors} errors)`);
-      }
+
+    const plans = [];
+    let routeErrors = 0;
+    let skippedPriceImpact = 0;
+    let skippedSlippage = 0;
+    let skippedNoRoute = 0;
+
+    console.log(`\n[Routes] Fetching routes for ${filtered.length} liquidatable positions...`);
+
+    for (const liquidation of filtered) {
+      const pair = `${liquidation.collateralSymbol}→${liquidation.loanSymbol}`;
+      const userShort = liquidation.user;
       
       try {
-        route = await fetchSwapRoute(
+        const route = await fetchSwapRoute(
           config.liquidSwapApiUrl,
           config.chainId,
           liquidation.marketParams.collateralToken,
           liquidation.marketParams.loanToken,
           liquidation.seizeAssets,
           activeExecutor,
-          liquidation.collateralDecimals // Pass token decimals for proper formatting
+          liquidation.collateralDecimals
         );
-        
+
         if (route) {
-          // Debug: log route info
-          if (config.testMode) {
-            console.log(`\n    Route found: ${liquidation.collateralSymbol} -> ${liquidation.loanSymbol}`);
-            console.log(`      expectedOut: ${route.expectedOut}, minAmountOut: ${route.minAmountOut}`);
-            console.log(`      priceImpact: ${route.priceImpact}%`);
-          }
-          
-          // Check price impact (reject routes with > 10% price impact)
+          // Check price impact
           const maxPriceImpact = config.maxPriceImpactPct || 10;
           if (route.priceImpact > maxPriceImpact) {
-            if (config.testMode) {
-              console.log(`      [PRICE_IMPACT_FAIL] ${route.priceImpact}% > ${maxPriceImpact}% limit`);
-            }
+            console.log(`  [SKIP] ${userShort}... ${pair}: price impact ${route.priceImpact}% > ${maxPriceImpact}%`);
+            skippedPriceImpact++;
             continue;
           }
-          
+
           // Check slippage
           const slippageCheck = checkSlippage(
             route.expectedOut,
             route.minAmountOut,
             config.slippageBps
           );
-          
+
           if (!slippageCheck.acceptable) {
-            if (config.testMode) {
-              console.log(`      [SLIPPAGE_FAIL] actual: ${slippageCheck.actualSlippageBps}bps > limit: ${config.slippageBps}bps`);
-            }
+            console.log(`  [SKIP] ${userShort}... ${pair}: slippage ${slippageCheck.actualSlippageBps}bps > ${config.slippageBps}bps`);
+            skippedSlippage++;
             continue;
           }
           
-          stats.routesFound++;
+          console.log(`  [ROUTE] ${userShort}... ${pair}: impact=${route.priceImpact}%, out=${formatAmount(route.expectedOut, liquidation.loanDecimals)}`);
         } else if (config.requireRoute) {
-          // In flashloan mode with REQUIRE_ROUTE=1, skip positions without routes
+          console.log(`  [SKIP] ${userShort}... ${pair}: no route found (REQUIRE_ROUTE=1)`);
           skippedNoRoute++;
-          if (config.testMode) {
-            console.log(`\n    [SKIP] No route for ${liquidation.collateralSymbol} -> ${liquidation.loanSymbol}`);
-          }
           continue;
+        } else {
+          console.log(`  [WARN] ${userShort}... ${pair}: no route, proceeding anyway`);
         }
-        
-        // Build appropriate plan based on execution mode
+
+        // Build plan
         if (config.executionEnabled) {
           const plan = buildExecutionPlan(config, liquidation, route);
           plans.push(plan);
+          console.log(`  [PLAN] ${userShort}... ${pair}: repay=${formatAmount(liquidation.repayAssets, liquidation.loanDecimals)} seize=${formatAmount(liquidation.seizeAssets, liquidation.collateralDecimals)}`);
         } else {
           const plan = buildLiquidationPlan(config, liquidation, route);
           plans.push(plan);
         }
-        
       } catch (error) {
         routeErrors++;
-        // Only log first few errors to reduce noise
-        if (routeErrors <= 3) {
-          console.warn(`\n  Route error for ${liquidation.user.slice(0, 10)}...: ${error.message}`);
-        }
-      }
-      
-      // Debug: if no route found
-      if (!route && config.testMode) {
-        console.log(`\n    No route: ${liquidation.collateralSymbol} -> ${liquidation.loanSymbol}`);
+        console.log(`  [ERROR] ${userShort}... ${pair}: ${error.message}`);
       }
     }
-    
-    console.log(`\n✓ Found ${stats.routesFound} swap routes (${routeErrors} errors, ${skippedNoRoute} skipped no-route)`);
-    
+
+    console.log(`[Routes] Summary: ${plans.length} plans, ${skippedPriceImpact} price-impact, ${skippedSlippage} slippage, ${skippedNoRoute} no-route, ${routeErrors} errors`);
+
     if (plans.length === 0) {
-      console.log('\n✓ No executable plans (missing routes). Exiting.');
-      stats.printSummary(config);
-      return;
+      console.log('[Routes] No executable plans created');
+      return metrics;
     }
-    
-    // Step 7: Simulate execution plans
-    console.log('\n[7/8] Simulating liquidation plans...');
-    console.log(`  Execution mode: ${config.executionMode}`);
-    
+
+    // Step 6: Simulate (capped) - skip if paused
+    if (isPaused) {
+      console.log('⏸ Bot is PAUSED (BOT_PAUSED=true). Skipping simulation/execution.');
+      return metrics;
+    }
+
+    const plansToSimulate = plans.slice(0, config.maxSimulationsPerTick);
+    metrics.simulatedCount = plansToSimulate.length;
+
+    console.log(`\n[Simulate] Simulating ${plansToSimulate.length} plans (mode: ${config.executionMode})...`);
+
     if (config.executionEnabled && executionClients) {
-      // Use appropriate simulation based on mode
-      for (const plan of plans) {
-        const simResult = await dispatchSimulation(
-          executionClients.publicClient,
-          plan,
-          config
-        );
+      for (const plan of plansToSimulate) {
+        const { liquidation } = plan;
+        const pair = `${liquidation.collateralSymbol}→${liquidation.loanSymbol}`;
+        const userShort = liquidation.user;
         
-        if (simResult.success) {
-          stats.simulatedOk++;
-          plan.simulationResult = simResult;
-          
-          // Check profitability based on mode
-          if (config.executionMode === 'flashloan') {
-            // For flashloan, check estimated profit
-            const estimatedProfit = plan.estimatedProfit || 0n;
-            if (estimatedProfit >= (plan.minProfit || 0n)) {
-              stats.profitable++;
-              plan.profitable = true;
-            } else if (config.allowBadDebt) {
-              stats.profitable++;
-              plan.profitable = true;
-            }
-          } else {
-            // For prefund mode, check route output vs repay
-            const { route, liquidation } = plan;
-            if (route && route.expectedOut > liquidation.repayAssets) {
-              stats.profitable++;
-              plan.profitable = true;
-            } else if (config.allowBadDebt) {
-              stats.profitable++;
-              plan.profitable = true;
-            }
+        try {
+          console.log(`  [SIM] ${userShort}... ${pair}: starting simulation...`);
+          console.log(`    flashloanToken: ${plan.flashloanToken}`);
+          console.log(`    flashloanAssets: ${plan.flashloanAssets}`);
+          console.log(`    repayAssets: ${plan.liquidation?.repayAssets}`);
+          console.log(`    seizeAssets: ${plan.liquidation?.seizeAssets}`);
+          console.log(`    estimatedProfit: ${plan.estimatedProfit}`);
+          console.log(`    calls: ${plan.calls?.length || 0}`);
+          if (plan.calls) {
+            plan.calls.forEach((c, i) => {
+              console.log(`      [${i}] ${c.description || c.target}`);
+              console.log(`          target: ${c.target}`);
+              console.log(`          data: ${c.data?.slice(0, 74)}...`);
+            });
+          }
+          if (plan.route?.debug) {
+            console.log(`    route debug:`);
+            console.log(`      amountInSent: ${plan.route.debug.amountInSent}`);
+            console.log(`      amountOutFromApi: ${plan.route.debug.amountOutFromApi}`);
+            console.log(`      detailsAmountOut: ${plan.route.debug.detailsAmountOut}`);
           }
           
-          const modeTag = config.executionMode === 'flashloan' ? 'FLASH_SIM_OK' : 'SIM_OK';
-          console.log(`  [${modeTag}] ${plan.liquidation.user.slice(0, 10)}... gas: ${simResult.gasEstimate}`);
-        } else {
-          const modeTag = config.executionMode === 'flashloan' ? 'FLASH_SIM_FAIL' : 'SIM_FAIL';
-          console.log(`  [${modeTag}] ${plan.liquidation.user.slice(0, 10)}... ${simResult.error}`);
-          addToCooldown(plan.liquidation.marketId, plan.liquidation.user, `Sim failed: ${simResult.error}`);
+          const simResult = await dispatchSimulation(
+            executionClients.publicClient,
+            plan,
+            config
+          );
+
+          if (simResult.success) {
+            metrics.simSuccessCount++;
+            plan.simulationResult = simResult;
+            console.log(`  [SIM_OK] ${userShort}... ${pair}: gas=${simResult.gasEstimate}`);
+
+            // Check profitability (or skip check if ALLOW_UNPROFITABLE=1)
+            if (config.allowUnprofitable) {
+              metrics.profitOkCount++;
+              plan.profitable = true;
+              console.log(`  [PROFIT_OK] ${userShort}... profitable=true (ALLOW_UNPROFITABLE=1)`);
+            } else if (config.executionMode === 'flashloan') {
+              const estimatedProfit = plan.estimatedProfit || 0n;
+              const minProfit = plan.minProfit || 0n;
+              console.log(`  [PROFIT] ${userShort}... estimated=${estimatedProfit}, min=${minProfit}, allowBadDebt=${config.allowBadDebt}`);
+              
+              if (estimatedProfit >= minProfit) {
+                metrics.profitOkCount++;
+                plan.profitable = true;
+                console.log(`  [PROFIT_OK] ${userShort}... profitable=true`);
+              } else if (config.allowBadDebt) {
+                metrics.profitOkCount++;
+                plan.profitable = true;
+                console.log(`  [PROFIT_OK] ${userShort}... profitable=true (allowBadDebt)`);
+              } else {
+                console.log(`  [PROFIT_FAIL] ${userShort}... not profitable and allowBadDebt=false`);
+              }
+            } else {
+              const { route } = plan;
+              if (route) {
+                const expectedOut = route.expectedOut;
+                const repayAssets = liquidation.repayAssets;
+                console.log(`  [PROFIT] ${userShort}... expectedOut=${expectedOut}, repay=${repayAssets}`);
+                
+                if (expectedOut > repayAssets) {
+                  metrics.profitOkCount++;
+                  plan.profitable = true;
+                  console.log(`  [PROFIT_OK] ${userShort}... profitable=true`);
+                } else if (config.allowBadDebt) {
+                  metrics.profitOkCount++;
+                  plan.profitable = true;
+                  console.log(`  [PROFIT_OK] ${userShort}... profitable=true (allowBadDebt)`);
+                } else {
+                  console.log(`  [PROFIT_FAIL] ${userShort}... not profitable and allowBadDebt=false`);
+                }
+              } else {
+                console.log(`  [PROFIT_FAIL] ${userShort}... no route`);
+              }
+            }
+          } else {
+            console.log(`  [SIM_FAIL] ${userShort}... ${pair}: ${simResult.error}`);
+            addToCooldown(plan.liquidation.marketId, plan.liquidation.user, `Sim failed: ${simResult.error}`, 'fail');
+          }
+        } catch (error) {
+          metrics.errorsCount++;
+          console.log(`  [SIM_ERROR] ${userShort}... ${pair}: ${error.message}`);
+          addToCooldown(plan.liquidation.marketId, plan.liquidation.user, `Sim error: ${error.message}`, 'fail');
         }
       }
     } else {
-      // Use Milestone 2 style simulation
       const client = createClient(config.rpcUrl);
       const simulations = await batchSimulate(
         client,
-        plans,
+        plansToSimulate,
         config.treasuryAddress,
-        config.maxSimulations
+        config.maxSimulationsPerTick
       );
-      
+
       for (let i = 0; i < simulations.length; i++) {
         const sim = simulations[i];
-        plans[i].simulationResult = sim;
-        
+        plansToSimulate[i].simulationResult = sim;
+
         if (sim.planValid) {
-          stats.simulatedOk++;
+          metrics.simSuccessCount++;
           if (isProfitable(sim, config.minProfitUsd)) {
-            stats.profitable++;
-            plans[i].profitable = true;
+            metrics.profitOkCount++;
+            plansToSimulate[i].profitable = true;
           }
         }
       }
     }
-    
-    console.log(`✓ ${stats.simulatedOk} simulations successful`);
-    console.log(`✓ ${stats.profitable} potentially profitable`);
-    
-    // Step 8: Execute (if enabled)
+
+    console.log(`[Simulate] Summary: ${metrics.simSuccessCount}/${metrics.simulatedCount} succeeded, ${metrics.profitOkCount} profitable`);
+
+    // Check for liquidatable trigger
+    if (metrics.liquidatableCount > 0) {
+      metrics.triggers.hasLiquidatable = true;
+    }
+
+    // Step 7: Execute (if enabled)
     if (config.executionEnabled && executionClients) {
-      const execModeLabel = config.executionMode === 'flashloan' ? 'FLASHLOAN' : 'PREFUND';
-      console.log(`\n[8/8] Executing liquidations (${execModeLabel} mode)...`);
-      
-      const toExecute = plans
+      const toExecute = plansToSimulate
         .filter(p => p.simulationResult?.success && p.profitable)
-        .slice(0, config.maxTxPerRun);
-      
-      if (toExecute.length === 0) {
-        console.log('✓ No profitable positions to execute.');
-      } else {
-        console.log(`Executing ${toExecute.length} liquidations (max: ${config.maxTxPerRun})...`);
-        
-        const activeExecutor = getActiveExecutorAddress(config);
-        
-        for (const plan of toExecute) {
-          const { liquidation } = plan;
-          
-          const execTag = config.executionMode === 'flashloan' ? 'FLASH_START' : 'EXEC_START';
-          console.log(`\n[${execTag}] ${liquidation.loanSymbol}/${liquidation.collateralSymbol} - ${liquidation.user.slice(0, 10)}...`);
-          
-          if (config.executionMode === 'flashloan') {
-            console.log(`  Flashloan: ${plan.flashloanAssets} ${liquidation.loanSymbol}`);
-            console.log(`  Est. profit: ${plan.estimatedProfit} ${liquidation.loanSymbol}`);
-          }
-          
-          // Get balance before (for profit tracking)
+        .slice(0, config.maxTxPerTick);
+
+      metrics.executedCount = toExecute.length;
+
+      for (const plan of toExecute) {
+        const { liquidation } = plan;
+
+        try {
+          // Get balance before
           const balanceBefore = await executionClients.publicClient.readContract({
             address: plan.loanToken,
             abi: require('./lib/encodePlan').ERC20_ABI,
             functionName: 'balanceOf',
-            args: [config.treasuryAddress], // Track treasury balance for flashloan mode
+            args: [config.treasuryAddress],
           });
-          
-          // Execute using appropriate method
+
+          // Execute
           const result = await dispatchExecution(
             executionClients.walletClient,
             executionClients.publicClient,
@@ -515,31 +524,23 @@ async function main() {
             config,
             plan.simulationResult
           );
-          
+
           if (result.success) {
-            stats.executed++;
+            metrics.execSuccessCount++;
+            metrics.triggers.hasExec = true;
             clearCooldown(liquidation.marketId, liquidation.user);
-            
-            // Calculate actual profit (treasury balance delta)
+
+            // Calculate profit
             const profitInfo = await calculateActualProfit(
               executionClients.publicClient,
               config.treasuryAddress,
               plan.loanToken,
               balanceBefore
             );
-            
-            if (profitInfo.profit && profitInfo.profit > 0n) {
-              stats.totalProfit += profitInfo.profit;
-            }
-            
+
             const okTag = config.executionMode === 'flashloan' ? 'FLASH_OK' : 'EXEC_OK';
-            console.log(`[${okTag}] TX: ${result.hash}`);
-            console.log(`  Gas used: ${result.gasUsed?.toLocaleString()}`);
-            console.log(`  Block: ${result.blockNumber}`);
-            if (profitInfo.profit !== undefined) {
-              console.log(`  Profit: ${formatUnits(profitInfo.profit, liquidation.loanDecimals)} ${liquidation.loanSymbol}`);
-            }
-            
+            console.log(`  [${okTag}] ${liquidation.user} TX: ${result.hash}`);
+
             // Telegram notification
             if (config.telegramToken && config.telegramChatId) {
               await sendTelegramNotification(
@@ -548,15 +549,13 @@ async function main() {
                 formatSuccessNotification(result, plan, profitInfo)
               );
             }
-            
           } else {
-            stats.failed++;
-            addToCooldown(liquidation.marketId, liquidation.user, `Exec failed: ${result.error}`);
-            
+            metrics.errorsCount++;
+            addToCooldown(liquidation.marketId, liquidation.user, `Exec failed: ${result.error}`, 'execFail');
+
             const failTag = config.executionMode === 'flashloan' ? 'FLASH_FAIL' : 'EXEC_FAIL';
-            console.log(`[${failTag}] ${result.error}`);
-            stats.errors.push(`${liquidation.user.slice(0, 10)}...: ${result.error}`);
-            
+            console.log(`  [${failTag}] ${liquidation.user} ${result.error}`);
+
             // Telegram notification
             if (config.telegramToken && config.telegramChatId) {
               await sendTelegramNotification(
@@ -566,58 +565,115 @@ async function main() {
               );
             }
           }
+        } catch (error) {
+          metrics.errorsCount++;
+          addToCooldown(liquidation.marketId, liquidation.user, `Exec error: ${error.message}`, 'execFail');
         }
       }
-    } else {
-      console.log('\n[8/8] Execution disabled (EXECUTION_ENABLED=0)');
-      
-      // Print simulation results
-      const simulated = plans.filter(p => p.simulationResult?.planValid || p.simulationResult?.success);
-      printLiquidations(simulated.map(p => ({
-        liquidation: p.liquidation,
-        route: p.route,
-        planValid: true,
-        profitEstimate: p.route ? {
-          grossProfit: p.route.expectedOut > p.liquidation.repayAssets 
-            ? p.route.expectedOut - p.liquidation.repayAssets 
-            : 0n,
-        } : null,
-        totalGasEstimate: p.estimatedGas,
-      })), config.maxPositionsPrint);
     }
-    
-    // Print summary
-    stats.printSummary(config);
-    
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
-    console.log(`\n✓ Milestone 4 run complete in ${elapsed}s`);
-    console.log(`✓ Execution mode: ${config.executionMode}`);
-    
-    if (config.executionEnabled) {
-      console.log(`✓ Executed: ${stats.executed}, Failed: ${stats.failed}`);
-      if (stats.totalProfit > 0n) {
-        console.log(`✓ Total profit: ${stats.totalProfit.toString()} (raw)`);
-      }
-    } else {
-      console.log('✓ No transactions sent (EXECUTION_ENABLED=0)\n');
+
+    return metrics;
+
+  } catch (error) {
+    console.error(`Tick error: ${error.message}`);
+    metrics.errorsCount++;
+    return metrics;
+  }
+}
+
+/**
+ * Initialize execution clients and verify setup
+ */
+async function initializeExecutionClients(config) {
+  if (!config.executionEnabled) {
+    return null;
+  }
+
+  console.log('\nInitializing execution clients...');
+  const executionClients = createExecutionClients(config);
+  const activeExecutor = getActiveExecutorAddress(config);
+
+  if (config.executionMode === 'flashloan') {
+    const verification = await verifyFlashloanExecutor(
+      executionClients.publicClient,
+      activeExecutor,
+      executionClients.account.address,
+      config.morphoBlueAddress
+    );
+
+    if (!verification.valid) {
+      console.error(`\n❌ Flashloan executor verification failed:`);
+      verification.errors.forEach(e => console.error(`  - ${e}`));
+      process.exit(1);
     }
-    
-    process.exit(0);
-    
+    console.log(`✓ Flashloan executor verified. Owner: ${verification.owner}, Morpho: ${verification.morpho}`);
+  } else {
+    const isOwner = await verifyExecutorOwnership(
+      executionClients.publicClient,
+      activeExecutor,
+      executionClients.account.address
+    );
+
+    if (!isOwner) {
+      console.error(`\n❌ Bot account ${executionClients.account.address} is not owner of executor ${activeExecutor}`);
+      process.exit(1);
+    }
+    console.log(`✓ Executor ownership verified. Bot: ${executionClients.account.address}`);
+  }
+
+  return executionClients;
+}
+
+/**
+ * Main entry point
+ */
+async function main() {
+  try {
+    // Load configuration
+    const config = getConfig();
+
+    // Print startup banner
+    printStartupBanner(config);
+
+    // Initialize execution clients if needed
+    const executionClients = await initializeExecutionClients(config);
+
+    // Initialize backlog
+    const backlog = new CandidateBacklog(config);
+
+    // Create context
+    const ctx = {
+      config,
+      executionClients,
+      backlog,
+    };
+
+    // Run once or start scheduler
+    if (config.runOnce) {
+      console.log('\n[RUN_ONCE=1] Running single tick...\n');
+      const metrics = await runTick(ctx);
+      console.log('\n✓ Single tick complete');
+      console.log(`  Candidates: ${metrics.fetchedCandidates}, Confirmed: ${metrics.confirmedCount}, Liquidatable: ${metrics.liquidatableCount}`);
+      console.log(`  Simulated: ${metrics.simSuccessCount}/${metrics.simulatedCount}, Executed: ${metrics.execSuccessCount}/${metrics.executedCount}`);
+      process.exit(0);
+    } else {
+      // Start scheduler
+      const scheduler = new Scheduler(config);
+      await scheduler.runScheduler(runTick, ctx);
+    }
+
   } catch (error) {
     console.error('\n❌ Error:', error.message);
     console.error(error.stack);
-    
-    stats.errors.push(error.message);
-    
+
     if (error.message.includes('fetch') || error.message.includes('ECONNREFUSED')) {
       console.error('\n💡 Network error: check RPC and API connectivity.');
     }
-    
+
     if (error.message.includes('EXECUTOR_ADDRESS') || error.message.includes('PRIVATE_KEY')) {
       console.error('\n💡 Configuration error: check required env vars for execution mode.');
     }
-    
+
     process.exit(1);
   }
 }

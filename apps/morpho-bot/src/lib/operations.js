@@ -8,7 +8,7 @@ const { formatUnits } = require('viem');
 /**
  * In-memory cooldown cache
  * Key: `${marketId}:${user}` (lowercase)
- * Value: { failedAt: timestamp, reason: string }
+ * Value: { failedAt: timestamp, reason: string, type: string }
  */
 const cooldownCache = new Map();
 
@@ -52,16 +52,59 @@ function checkCooldown(marketId, user, cooldownMinutes) {
 }
 
 /**
+ * Check cooldown with type-specific duration
+ * @param {string} marketId - Market ID
+ * @param {string} user - User address
+ * @param {Object} cooldownConfig - Cooldown configuration with different types
+ * @returns {Object} { inCooldown: boolean, reason?: string, remainingMinutes?: number }
+ */
+function checkCooldownByType(marketId, user, cooldownConfig) {
+  const key = `${marketId.toLowerCase()}:${user.toLowerCase()}`;
+  const entry = cooldownCache.get(key);
+  
+  if (!entry) {
+    return { inCooldown: false };
+  }
+  
+  // Determine cooldown duration based on type
+  let cooldownMinutes;
+  if (entry.type === 'solvent') {
+    cooldownMinutes = cooldownConfig.solventCooldownMinutes || 30;
+  } else if (entry.type === 'execFail') {
+    cooldownMinutes = cooldownConfig.execFailCooldownMinutes || 120;
+  } else {
+    // Default to fail cooldown (simulation failures, etc.)
+    cooldownMinutes = cooldownConfig.failCooldownMinutes || 60;
+  }
+  
+  const elapsed = (Date.now() - entry.failedAt) / 1000 / 60; // minutes
+  
+  if (elapsed >= cooldownMinutes) {
+    // Cooldown expired, remove entry
+    cooldownCache.delete(key);
+    return { inCooldown: false };
+  }
+  
+  return {
+    inCooldown: true,
+    reason: entry.reason,
+    remainingMinutes: Math.ceil(cooldownMinutes - elapsed),
+  };
+}
+
+/**
  * Add position to cooldown
  * @param {string} marketId - Market ID
  * @param {string} user - User address
  * @param {string} reason - Reason for cooldown
+ * @param {string} type - Cooldown type: 'solvent', 'fail', 'execFail' (default: 'fail')
  */
-function addToCooldown(marketId, user, reason) {
+function addToCooldown(marketId, user, reason, type = 'fail') {
   const key = `${marketId.toLowerCase()}:${user.toLowerCase()}`;
   cooldownCache.set(key, {
     failedAt: Date.now(),
     reason,
+    type,
   });
 }
 
@@ -303,6 +346,7 @@ class RunStats {
 module.exports = {
   isBotPaused,
   checkCooldown,
+  checkCooldownByType,
   addToCooldown,
   clearCooldown,
   getCooldownStats,

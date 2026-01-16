@@ -286,7 +286,7 @@ async function confirmLiquidatable(client, morphoBlueAddress, candidate, config 
     if (config.testMode && isLiquidatable) {
       console.log(`\n  🔍 At-risk position found (TEST MODE):`);
       console.log(`    Market: ${candidate.loanSymbol}/${candidate.collateralSymbol}`);
-      console.log(`    User: ${candidate.user.slice(0, 10)}...`);
+      console.log(`    User: ${candidate.user}`);
       console.log(`    Borrow: ${borrowAssets} (${formatBigInt(borrowAssets, 18, 4)} ${candidate.loanSymbol})`);
       console.log(`    Max allowed: ${maxBorrow} (${formatBigInt(maxBorrow, 18, 4)})`);
       console.log(`    Health factor: ${borrowAssets > 0n ? Number((maxBorrow * 10000n) / borrowAssets) / 100 : 'N/A'}%`);
@@ -317,7 +317,14 @@ async function confirmLiquidatable(client, morphoBlueAddress, candidate, config 
     const seizeAssets = (seizeValue * ORACLE_PRICE_SCALE) / oraclePrice;
     
     // Cap seize amount to available collateral
-    const finalSeizeAssets = seizeAssets > collateral ? collateral : seizeAssets;
+    let finalSeizeAssets = seizeAssets > collateral ? collateral : seizeAssets;
+    
+    // Apply seize buffer to avoid rounding/timing issues
+    // seizeBufferBps is passed via config (default 5 bps = 0.05%)
+    const seizeBufferBps = config?.seizeBufferBps || 5;
+    if (seizeBufferBps > 0) {
+      finalSeizeAssets = finalSeizeAssets - (finalSeizeAssets * BigInt(seizeBufferBps)) / 10000n;
+    }
     
     return {
       marketId,
@@ -462,7 +469,7 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
           
           console.log(`\n  🔍 At-risk position found (TEST MODE):`);
           console.log(`    Market: ${candidate.loanSymbol}/${candidate.collateralSymbol}`);
-          console.log(`    User: ${candidate.user.slice(0, 10)}...`);
+          console.log(`    User: ${candidate.user}`);
           console.log(`    Borrow: ${borrowAssets} (${formatBigInt(borrowAssets, 18, 4)} ${candidate.loanSymbol})`);
           console.log(`    Max allowed: ${maxBorrow} (${formatBigInt(maxBorrow, 18, 4)})`);
           console.log(`    Seizable collateral: ${seizableCollateral} (${formatBigInt(seizableCollateral, candidate.collateralDecimals, 4)} ${candidate.collateralSymbol})`);
@@ -472,14 +479,30 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
         
         if (isLiquidatable) {
           // Calculate liquidation amounts
-          // For simplicity, we'll liquidate up to 50% of the position
+          // Liquidate up to 50% of the position
           const repayShares = borrowShares / 2n;
           const repayAssets = totalBorrowShares > 0n
             ? (repayShares * totalBorrowAssets) / totalBorrowShares
             : 0n;
           
-          // Use seizableCollateral from SDK (already accounts for incentive)
-          const finalSeizeAssets = MathLib.min(seizableCollateral, collateral);
+          // Calculate seizeAssets from repayAssets (must be consistent!)
+          // seizeAssets = repayAssets * (1 + liquidationIncentive) * ORACLE_PRICE_SCALE / oraclePrice
+          // liquidationIncentive = 1 / LLTV - 1 (standard Morpho formula)
+          const ORACLE_PRICE_SCALE = 10n ** 36n;
+          const WAD = 10n ** 18n;
+          const liquidationIncentiveFactor = WAD + MathLib.wDivDown(WAD - lltv, lltv); // 1 + (1-lltv)/lltv = 1/lltv
+          const seizeValue = MathLib.wMulDown(repayAssets, liquidationIncentiveFactor);
+          let calculatedSeizeAssets = (seizeValue * ORACLE_PRICE_SCALE) / oraclePrice;
+          
+          // Cap to available collateral and seizableCollateral
+          let finalSeizeAssets = MathLib.min(calculatedSeizeAssets, MathLib.min(seizableCollateral, collateral));
+          
+          // Apply seize buffer to avoid rounding/timing issues
+          // seizeBufferBps is passed via config (default 5 bps = 0.05%)
+          const seizeBufferBps = config?.seizeBufferBps || 5;
+          if (seizeBufferBps > 0 && finalSeizeAssets > 0n) {
+            finalSeizeAssets = finalSeizeAssets - (finalSeizeAssets * BigInt(seizeBufferBps)) / 10000n;
+          }
           
           confirmed.push({
             marketId: candidate.marketId,
@@ -506,7 +529,7 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
           });
           
           if (!config.testMode) {
-            console.log(`    ✓ Liquidatable: ${candidate.user.slice(0, 10)}... ${candidate.loanSymbol}/${candidate.collateralSymbol}`);
+            console.log(`    ✓ Liquidatable: ${candidate.user} ${candidate.loanSymbol}/${candidate.collateralSymbol}`);
           }
         } else {
           healthy++;
