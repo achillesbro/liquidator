@@ -48,7 +48,10 @@ class TTLCache {
         }
         
         if (loaded > 0 || expired > 0) {
-          console.log(`[Cache] Loaded ${loaded} entries from disk (${expired} expired)`);
+          const isJsonl = (process.env.LOG_FORMAT || 'pretty').toLowerCase() === 'jsonl';
+          if (!isJsonl) {
+            console.log(`[Cache] Loaded ${loaded} entries from disk (${expired} expired)`);
+          }
         }
       }
     } catch (error) {
@@ -83,16 +86,21 @@ class TTLCache {
   async getOrSet(key, ttlMs, fetcher) {
     const entry = this.entries.get(key);
     const now = Date.now();
+    const isJsonl = (process.env.LOG_FORMAT || 'pretty').toLowerCase() === 'jsonl';
 
     // Check if entry exists and is still valid
     if (entry && entry.expiresAt > now) {
       const remainingMs = entry.expiresAt - now;
-      console.log(`[Cache] HIT: ${key} (expires in ${Math.round(remainingMs / 1000)}s)`);
+      if (!isJsonl) {
+        console.log(`[Cache] HIT: ${key} (expires in ${Math.round(remainingMs / 1000)}s)`);
+      }
       return entry.value;
     }
 
     // Fetch new value
-    console.log(`[Cache] MISS: ${key} - fetching...`);
+    if (!isJsonl) {
+      console.log(`[Cache] MISS: ${key} - fetching...`);
+    }
     const value = await fetcher();
 
     // Store with expiration

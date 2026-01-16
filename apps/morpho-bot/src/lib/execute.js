@@ -24,6 +24,7 @@ try {
 }
 const { checkExecutorBalance, ERC20_ABI } = require('./encodePlan');
 const { getActiveExecutorAddress } = require('./env');
+const { isJsonlEnabled, emitEvent, log } = require('./logger');
 
 // Executor606BaXt ABI (prefund mode)
 const EXECUTOR_ABI = parseAbi([
@@ -218,7 +219,18 @@ async function executeViaExecutor(walletClient, publicClient, plan, config, simu
       gas: config.maxGas ? BigInt(config.maxGas) : BigInt(Math.ceil(gasEstimate * 1.3)),
     });
     
-    console.log(`[EXEC_SENT] tx: ${hash}`);
+    const mode = 'PREFUND';
+    const tickId = plan.tickId || config._currentTickId || 'T?';
+    
+    // Emit tx_sent event
+    emitEvent(config, {
+      type: 'tx_sent',
+      tickId,
+      mode,
+      txHash: hash,
+    });
+    
+    log(config, `[EXEC_SENT] tx: ${hash}`);
     
     // Call onSent callback if provided
     if (onSent) {
@@ -229,6 +241,14 @@ async function executeViaExecutor(walletClient, publicClient, plan, config, simu
     const receipt = await publicClient.waitForTransactionReceipt({
       hash,
       timeout: 60_000, // 60 second timeout
+    });
+    
+    // Emit tx_confirmed event
+    emitEvent(config, {
+      type: 'tx_confirmed',
+      tickId,
+      mode,
+      txHash: hash,
     });
     
     if (receipt.status === 'success') {
@@ -591,7 +611,18 @@ async function executeViaFlashloan(walletClient, publicClient, plan, config, sim
       gas: config.maxGas ? BigInt(config.maxGas) : BigInt(Math.ceil(gasEstimate * 1.3)),
     });
     
-    console.log(`[FLASH_SENT] tx: ${hash}`);
+    const mode = 'FLASHLOAN';
+    const tickId = plan.tickId || config._currentTickId || 'T?';
+    
+    // Emit tx_sent event
+    emitEvent(config, {
+      type: 'tx_sent',
+      tickId,
+      mode,
+      txHash: hash,
+    });
+    
+    log(config, `[FLASH_SENT] tx: ${hash}`);
     
     // Call onSent callback if provided
     if (onSent) {
@@ -602,6 +633,14 @@ async function executeViaFlashloan(walletClient, publicClient, plan, config, sim
     const receipt = await publicClient.waitForTransactionReceipt({
       hash,
       timeout: 60_000, // 60 second timeout
+    });
+    
+    // Emit tx_confirmed event
+    emitEvent(config, {
+      type: 'tx_confirmed',
+      tickId,
+      mode,
+      txHash: hash,
     });
     
     if (receipt.status === 'success') {

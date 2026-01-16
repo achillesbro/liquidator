@@ -4,6 +4,7 @@
  */
 
 const { updateHealthState, markReady } = require('./health');
+const { isJsonlEnabled, log } = require('./logger');
 
 /**
  * Tick metrics structure
@@ -100,16 +101,19 @@ class Scheduler {
   async runScheduler(runTick, ctx, onShutdown) {
     this.isRunning = true;
     this.shutdownRequested = false;
+    const config = ctx.config;
 
-    console.log('\n' + '='.repeat(70));
-    console.log('Scheduler started');
-    console.log(`Mode: ${this.mode} (${this.baseSeconds}s base, ${this.fastSeconds}s fast)`);
-    console.log(`Jitter: ±${this.jitterPct}%`);
-    console.log('='.repeat(70) + '\n');
+    if (!isJsonlEnabled(config)) {
+      console.log('\n' + '='.repeat(70));
+      console.log('Scheduler started');
+      console.log(`Mode: ${this.mode} (${this.baseSeconds}s base, ${this.fastSeconds}s fast)`);
+      console.log(`Jitter: ±${this.jitterPct}%`);
+      console.log('='.repeat(70) + '\n');
+    }
 
     // Handle graceful shutdown
     const shutdown = async () => {
-      console.log('\n⏸ Shutdown requested. Waiting for current tick to finish...');
+      log(config, '\n⏸ Shutdown requested. Waiting for current tick to finish...');
       this.shutdownRequested = true;
 
       // Wait for current tick with timeout
@@ -121,7 +125,7 @@ class Scheduler {
       }
 
       if (this.currentTick) {
-        console.log('⚠ Current tick did not finish in time. Forcing exit.');
+        log(config, '⚠ Current tick did not finish in time. Forcing exit.');
       }
 
       // Call cleanup callback if provided
@@ -155,7 +159,8 @@ class Scheduler {
           await this.currentTick;
         }
 
-        // Run new tick
+        // Run new tick (pass scheduler instance for tickId)
+        ctx.scheduler = this;
         this.currentTick = this.runTickWithMetrics(runTick, ctx);
         const metrics = await this.currentTick;
         this.currentTick = null;
@@ -188,7 +193,7 @@ class Scheduler {
           await new Promise(resolve => setTimeout(resolve, waitTime));
         } else {
           // Tick took longer than interval, continue immediately
-          console.log(`⚠ Tick took ${(elapsed / 1000).toFixed(1)}s (longer than interval)`);
+          log(config, `⚠ Tick took ${(elapsed / 1000).toFixed(1)}s (longer than interval)`);
         }
       }
     }
@@ -257,9 +262,15 @@ class Scheduler {
    * @param {boolean} modeChanged - Whether mode changed
    */
   logTickSummary(tickNumber, metrics, modeBefore, modeChanged) {
+    const config = this.config;
     const modeLabel = this.mode === 'FAST' ? 'FAST' : 'BASE';
     const duration = (metrics.durationMs / 1000).toFixed(1);
     const cadence = this.mode === 'FAST' ? this.fastSeconds : this.baseSeconds;
+
+    // In jsonl mode, tick summaries are handled by index.js tick_end events
+    if (isJsonlEnabled(config)) {
+      return;
+    }
 
     const parts = [
       `[T${tickNumber}]`,
@@ -293,6 +304,7 @@ class Scheduler {
       return;
     }
 
+    const config = this.config;
     let reason = '';
     if (triggers.hasLiquidatable) {
       reason = 'liquidatable found';
@@ -302,7 +314,7 @@ class Scheduler {
       reason = 'fast mode expired';
     }
 
-    console.log(`→ ${toMode} MODE${reason ? ` (reason: ${reason})` : ''}`);
+    log(config, `→ ${toMode} MODE${reason ? ` (reason: ${reason})` : ''}`);
   }
 
   /**

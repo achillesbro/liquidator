@@ -101,7 +101,10 @@ function createHealthServer(port = 4001) {
   });
   
   server.listen(port, '0.0.0.0', () => {
-    console.log(`Health server listening on port ${port}`);
+    const isJsonl = (process.env.LOG_FORMAT || 'pretty').toLowerCase() === 'jsonl';
+    if (!isJsonl) {
+      console.log(`Health server listening on port ${port}`);
+    }
   });
   
   // Handle errors gracefully

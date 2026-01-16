@@ -44,6 +44,7 @@ const cache = require('./lib/cache');
 const { CandidateBacklog } = require('./lib/backlog');
 const { Scheduler } = require('./lib/scheduler');
 const { createHealthServer, updateHealthState } = require('./lib/health');
+const { isJsonlEnabled, emitEvent, log, logError } = require('./lib/logger');
 
 /**
  * Format bigint for display
@@ -63,6 +64,11 @@ function formatAmount(amount, decimals = 18) {
  * Print startup banner
  */
 function printStartupBanner(config) {
+  if (isJsonlEnabled(config)) {
+    // Suppress banner in jsonl mode
+    return;
+  }
+  
   const mode = config.executionEnabled ? 'EXECUTION' : 'SIMULATION';
   const execMode = config.executionMode.toUpperCase();
   
@@ -117,6 +123,16 @@ function printStartupBanner(config) {
  */
 async function runTick(ctx) {
   const { config, executionClients, backlog } = ctx;
+  const tickStartTime = Date.now();
+  // Get tickId from scheduler if available, otherwise use a counter or default
+  let tickId = 'T?';
+  if (ctx.scheduler && ctx.scheduler.tickNumber) {
+    tickId = `T${ctx.scheduler.tickNumber}`;
+  } else if (ctx._tickCounter !== undefined) {
+    tickId = `T${ctx._tickCounter}`;
+  }
+  const mode = config.executionMode === 'flashloan' ? 'FLASHLOAN' : (config.executionMode === 'prefund' ? 'PREFUND' : 'BASE');
+  
   const metrics = {
     fetchedVaults: 0,
     fetchedMarkets: 0,
@@ -129,12 +145,24 @@ async function runTick(ctx) {
     executedCount: 0,
     execSuccessCount: 0,
     errorsCount: 0,
+    filteredCooldown: 0,
+    filteredCap: 0,
+    filteredDust: 0,
+    confirmedHealthy: 0,
+    confirmedErrors: 0,
     triggers: {
       hasLiquidatable: false,
       hasExec: false,
       hasNearMiss: false,
     },
   };
+
+  // Emit tick_start event
+  emitEvent(config, {
+    type: 'tick_start',
+    tickId,
+    mode,
+  });
 
   try {
     const isPaused = isBotPaused(config);
@@ -150,7 +178,14 @@ async function runTick(ctx) {
     metrics.fetchedVaults = vaults.length;
 
     if (vaults.length === 0) {
-      return metrics;
+      const durationMs = Date.now() - tickStartTime;
+      emitEvent(config, {
+        type: 'tick_skip',
+        tickId,
+        mode,
+        reason: 'no vaults found',
+      });
+      return { ...metrics, durationMs };
     }
 
     const vaultAddresses = vaults.map(v => v.address);
@@ -166,7 +201,14 @@ async function runTick(ctx) {
     metrics.fetchedMarkets = markets.length;
 
     if (markets.length === 0) {
-      return metrics;
+      const durationMs = Date.now() - tickStartTime;
+      emitEvent(config, {
+        type: 'tick_skip',
+        tickId,
+        mode,
+        reason: 'no markets found',
+      });
+      return { ...metrics, durationMs };
     }
 
     const marketIds = markets.map(m => m.id);
@@ -201,7 +243,14 @@ async function runTick(ctx) {
     });
 
     if (candidates.length === 0) {
-      return metrics;
+      const durationMs = Date.now() - tickStartTime;
+      emitEvent(config, {
+        type: 'tick_skip',
+        tickId,
+        mode,
+        reason: 'no candidates available',
+      });
+      return { ...metrics, durationMs };
     }
 
     // Step 4: Confirm liquidatable positions (capped)
@@ -226,11 +275,8 @@ async function runTick(ctx) {
 
     // Filter confirmed by cooldown, caps, and dust threshold
     const filtered = [];
-    let skippedCooldown = 0;
-    let skippedCap = 0;
-    let skippedDust = 0;
     
-    console.log(`\n[Filter] Filtering ${confirmed.length} confirmed positions (sorted by size desc)...`);
+    log(config, `\n[Filter] Filtering ${confirmed.length} confirmed positions (sorted by size desc)...`);
     
     for (const liquidation of confirmed) {
       const pair = `${liquidation.collateralSymbol}→${liquidation.loanSymbol}`;
@@ -248,38 +294,45 @@ async function runTick(ctx) {
       );
 
       if (cooldownCheck.inCooldown) {
-        console.log(`  [COOLDOWN] ${userShort} ${pair}: ${cooldownCheck.remainingMinutes}m remaining (${cooldownCheck.reason})`);
-        skippedCooldown++;
+        log(config, `  [COOLDOWN] ${userShort} ${pair}: ${cooldownCheck.remainingMinutes}m remaining (${cooldownCheck.reason})`);
+        metrics.filteredCooldown++;
         continue;
       }
 
       // Check repay cap (max)
       const capCheck = checkRepayCap(liquidation.repayAssets, config.maxRepayLoanAssets);
       if (capCheck.exceeds) {
-        console.log(`  [CAP] ${userShort} ${pair}: repay exceeds cap`);
-        skippedCap++;
+        log(config, `  [CAP] ${userShort} ${pair}: repay exceeds cap`);
+        metrics.filteredCap++;
         continue;
       }
 
       // Check dust threshold (min) - skip positions too small to be profitable
       if (config.minRepayAssets && liquidation.repayAssets < config.minRepayAssets) {
-        console.log(`  [DUST] ${userShort} ${pair}: repay=${formatAmount(liquidation.repayAssets, liquidation.loanDecimals)} < min ${formatAmount(config.minRepayAssets, liquidation.loanDecimals)}`);
-        skippedDust++;
+        log(config, `  [DUST] ${userShort} ${pair}: repay=${formatAmount(liquidation.repayAssets, liquidation.loanDecimals)} < min ${formatAmount(config.minRepayAssets, liquidation.loanDecimals)}`);
+        metrics.filteredDust++;
         // Add to cooldown so we don't keep checking it
         addToCooldown(liquidation.marketId, liquidation.user, 'Dust position', 'solvent');
         continue;
       }
 
-      console.log(`  [PASS] ${userShort} ${pair}: repay=${formatAmount(liquidation.repayAssets, liquidation.loanDecimals)} seize=${formatAmount(liquidation.seizeAssets, liquidation.collateralDecimals)}`);
+      log(config, `  [PASS] ${userShort} ${pair}: repay=${formatAmount(liquidation.repayAssets, liquidation.loanDecimals)} seize=${formatAmount(liquidation.seizeAssets, liquidation.collateralDecimals)}`);
       filtered.push(liquidation);
     }
 
-    console.log(`[Filter] Summary: ${filtered.length} passed, ${skippedCooldown} cooldown, ${skippedCap} cap, ${skippedDust} dust`);
+    log(config, `[Filter] Summary: ${filtered.length} passed, ${metrics.filteredCooldown} cooldown, ${metrics.filteredCap} cap, ${metrics.filteredDust} dust`);
 
     metrics.liquidatableCount = filtered.length;
 
     if (filtered.length === 0) {
-      return metrics;
+      const durationMs = Date.now() - tickStartTime;
+      emitEvent(config, {
+        type: 'tick_skip',
+        tickId,
+        mode,
+        reason: 'all filtered (cooldown/cap/dust)',
+      });
+      return { ...metrics, durationMs };
     }
 
     // Step 5: Fetch swap routes
@@ -293,7 +346,7 @@ async function runTick(ctx) {
     let skippedSlippage = 0;
     let skippedNoRoute = 0;
 
-    console.log(`\n[Routes] Fetching routes for ${filtered.length} liquidatable positions...`);
+    log(config, `\n[Routes] Fetching routes for ${filtered.length} liquidatable positions...`);
 
     for (const liquidation of filtered) {
       const pair = `${liquidation.collateralSymbol}→${liquidation.loanSymbol}`;
@@ -314,7 +367,7 @@ async function runTick(ctx) {
           // Check price impact
           const maxPriceImpact = config.maxPriceImpactPct || 10;
           if (route.priceImpact > maxPriceImpact) {
-            console.log(`  [SKIP] ${userShort}... ${pair}: price impact ${route.priceImpact}% > ${maxPriceImpact}%`);
+            log(config, `  [SKIP] ${userShort}... ${pair}: price impact ${route.priceImpact}% > ${maxPriceImpact}%`);
             skippedPriceImpact++;
             continue;
           }
@@ -327,52 +380,64 @@ async function runTick(ctx) {
           );
 
           if (!slippageCheck.acceptable) {
-            console.log(`  [SKIP] ${userShort}... ${pair}: slippage ${slippageCheck.actualSlippageBps}bps > ${config.slippageBps}bps`);
+            log(config, `  [SKIP] ${userShort}... ${pair}: slippage ${slippageCheck.actualSlippageBps}bps > ${config.slippageBps}bps`);
             skippedSlippage++;
             continue;
           }
           
-          console.log(`  [ROUTE] ${userShort}... ${pair}: impact=${route.priceImpact}%, out=${formatAmount(route.expectedOut, liquidation.loanDecimals)}`);
+          log(config, `  [ROUTE] ${userShort}... ${pair}: impact=${route.priceImpact}%, out=${formatAmount(route.expectedOut, liquidation.loanDecimals)}`);
         } else if (config.requireRoute) {
-          console.log(`  [SKIP] ${userShort}... ${pair}: no route found (REQUIRE_ROUTE=1)`);
+          log(config, `  [SKIP] ${userShort}... ${pair}: no route found (REQUIRE_ROUTE=1)`);
           skippedNoRoute++;
           continue;
         } else {
-          console.log(`  [WARN] ${userShort}... ${pair}: no route, proceeding anyway`);
+          log(config, `  [WARN] ${userShort}... ${pair}: no route, proceeding anyway`);
         }
 
         // Build plan
         if (config.executionEnabled) {
           const plan = buildExecutionPlan(config, liquidation, route);
           plans.push(plan);
-          console.log(`  [PLAN] ${userShort}... ${pair}: repay=${formatAmount(liquidation.repayAssets, liquidation.loanDecimals)} seize=${formatAmount(liquidation.seizeAssets, liquidation.collateralDecimals)}`);
+          log(config, `  [PLAN] ${userShort}... ${pair}: repay=${formatAmount(liquidation.repayAssets, liquidation.loanDecimals)} seize=${formatAmount(liquidation.seizeAssets, liquidation.collateralDecimals)}`);
         } else {
           const plan = buildLiquidationPlan(config, liquidation, route);
           plans.push(plan);
         }
       } catch (error) {
         routeErrors++;
-        console.log(`  [ERROR] ${userShort}... ${pair}: ${error.message}`);
+        log(config, `  [ERROR] ${userShort}... ${pair}: ${error.message}`);
       }
     }
 
-    console.log(`[Routes] Summary: ${plans.length} plans, ${skippedPriceImpact} price-impact, ${skippedSlippage} slippage, ${skippedNoRoute} no-route, ${routeErrors} errors`);
+    log(config, `[Routes] Summary: ${plans.length} plans, ${skippedPriceImpact} price-impact, ${skippedSlippage} slippage, ${skippedNoRoute} no-route, ${routeErrors} errors`);
 
     if (plans.length === 0) {
-      console.log('[Routes] No executable plans created');
-      return metrics;
+      const durationMs = Date.now() - tickStartTime;
+      emitEvent(config, {
+        type: 'tick_skip',
+        tickId,
+        mode,
+        reason: 'no executable plans created',
+      });
+      return { ...metrics, durationMs };
     }
 
     // Step 6: Simulate (capped) - skip if paused
     if (isPaused) {
-      console.log('⏸ Bot is PAUSED (BOT_PAUSED=true). Skipping simulation/execution.');
-      return metrics;
+      const durationMs = Date.now() - tickStartTime;
+      emitEvent(config, {
+        type: 'tick_skip',
+        tickId,
+        mode,
+        reason: 'bot paused',
+      });
+      return { ...metrics, durationMs };
     }
 
     const plansToSimulate = plans.slice(0, config.maxSimulationsPerTick);
     metrics.simulatedCount = plansToSimulate.length;
 
-    console.log(`\n[Simulate] Simulating ${plansToSimulate.length} plans (mode: ${config.executionMode})...`);
+    log(config, `\n[Simulate] Simulating ${plansToSimulate.length} plans (mode: ${config.executionMode})...`);
 
     if (config.executionEnabled && executionClients) {
       for (const plan of plansToSimulate) {
@@ -381,25 +446,27 @@ async function runTick(ctx) {
         const userShort = liquidation.user;
         
         try {
-          console.log(`  [SIM] ${userShort}... ${pair}: starting simulation...`);
-          console.log(`    flashloanToken: ${plan.flashloanToken}`);
-          console.log(`    flashloanAssets: ${plan.flashloanAssets}`);
-          console.log(`    repayAssets: ${plan.liquidation?.repayAssets}`);
-          console.log(`    seizeAssets: ${plan.liquidation?.seizeAssets}`);
-          console.log(`    estimatedProfit: ${plan.estimatedProfit}`);
-          console.log(`    calls: ${plan.calls?.length || 0}`);
-          if (plan.calls) {
-            plan.calls.forEach((c, i) => {
-              console.log(`      [${i}] ${c.description || c.target}`);
-              console.log(`          target: ${c.target}`);
-              console.log(`          data: ${c.data?.slice(0, 74)}...`);
-            });
-          }
-          if (plan.route?.debug) {
-            console.log(`    route debug:`);
-            console.log(`      amountInSent: ${plan.route.debug.amountInSent}`);
-            console.log(`      amountOutFromApi: ${plan.route.debug.amountOutFromApi}`);
-            console.log(`      detailsAmountOut: ${plan.route.debug.detailsAmountOut}`);
+          if (!isJsonlEnabled(config)) {
+            console.log(`  [SIM] ${userShort}... ${pair}: starting simulation...`);
+            console.log(`    flashloanToken: ${plan.flashloanToken}`);
+            console.log(`    flashloanAssets: ${plan.flashloanAssets}`);
+            console.log(`    repayAssets: ${plan.liquidation?.repayAssets}`);
+            console.log(`    seizeAssets: ${plan.liquidation?.seizeAssets}`);
+            console.log(`    estimatedProfit: ${plan.estimatedProfit}`);
+            console.log(`    calls: ${plan.calls?.length || 0}`);
+            if (plan.calls) {
+              plan.calls.forEach((c, i) => {
+                console.log(`      [${i}] ${c.description || c.target}`);
+                console.log(`          target: ${c.target}`);
+                console.log(`          data: ${c.data?.slice(0, 74)}...`);
+              });
+            }
+            if (plan.route?.debug) {
+              console.log(`    route debug:`);
+              console.log(`      amountInSent: ${plan.route.debug.amountInSent}`);
+              console.log(`      amountOutFromApi: ${plan.route.debug.amountOutFromApi}`);
+              console.log(`      detailsAmountOut: ${plan.route.debug.detailsAmountOut}`);
+            }
           }
           
           const simResult = await dispatchSimulation(
@@ -411,58 +478,58 @@ async function runTick(ctx) {
           if (simResult.success) {
             metrics.simSuccessCount++;
             plan.simulationResult = simResult;
-            console.log(`  [SIM_OK] ${userShort}... ${pair}: gas=${simResult.gasEstimate}`);
+            log(config, `  [SIM_OK] ${userShort}... ${pair}: gas=${simResult.gasEstimate}`);
 
             // Check profitability (or skip check if ALLOW_UNPROFITABLE=1)
             if (config.allowUnprofitable) {
               metrics.profitOkCount++;
               plan.profitable = true;
-              console.log(`  [PROFIT_OK] ${userShort}... profitable=true (ALLOW_UNPROFITABLE=1)`);
+              log(config, `  [PROFIT_OK] ${userShort}... profitable=true (ALLOW_UNPROFITABLE=1)`);
             } else if (config.executionMode === 'flashloan') {
               const estimatedProfit = plan.estimatedProfit || 0n;
               const minProfit = plan.minProfit || 0n;
-              console.log(`  [PROFIT] ${userShort}... estimated=${estimatedProfit}, min=${minProfit}, allowBadDebt=${config.allowBadDebt}`);
+              log(config, `  [PROFIT] ${userShort}... estimated=${estimatedProfit}, min=${minProfit}, allowBadDebt=${config.allowBadDebt}`);
               
               if (estimatedProfit >= minProfit) {
                 metrics.profitOkCount++;
                 plan.profitable = true;
-                console.log(`  [PROFIT_OK] ${userShort}... profitable=true`);
+                log(config, `  [PROFIT_OK] ${userShort}... profitable=true`);
               } else if (config.allowBadDebt) {
                 metrics.profitOkCount++;
                 plan.profitable = true;
-                console.log(`  [PROFIT_OK] ${userShort}... profitable=true (allowBadDebt)`);
+                log(config, `  [PROFIT_OK] ${userShort}... profitable=true (allowBadDebt)`);
               } else {
-                console.log(`  [PROFIT_FAIL] ${userShort}... not profitable and allowBadDebt=false`);
+                log(config, `  [PROFIT_FAIL] ${userShort}... not profitable and allowBadDebt=false`);
               }
             } else {
               const { route } = plan;
               if (route) {
                 const expectedOut = route.expectedOut;
                 const repayAssets = liquidation.repayAssets;
-                console.log(`  [PROFIT] ${userShort}... expectedOut=${expectedOut}, repay=${repayAssets}`);
+                log(config, `  [PROFIT] ${userShort}... expectedOut=${expectedOut}, repay=${repayAssets}`);
                 
                 if (expectedOut > repayAssets) {
                   metrics.profitOkCount++;
                   plan.profitable = true;
-                  console.log(`  [PROFIT_OK] ${userShort}... profitable=true`);
+                  log(config, `  [PROFIT_OK] ${userShort}... profitable=true`);
                 } else if (config.allowBadDebt) {
                   metrics.profitOkCount++;
                   plan.profitable = true;
-                  console.log(`  [PROFIT_OK] ${userShort}... profitable=true (allowBadDebt)`);
+                  log(config, `  [PROFIT_OK] ${userShort}... profitable=true (allowBadDebt)`);
                 } else {
-                  console.log(`  [PROFIT_FAIL] ${userShort}... not profitable and allowBadDebt=false`);
+                  log(config, `  [PROFIT_FAIL] ${userShort}... not profitable and allowBadDebt=false`);
                 }
               } else {
-                console.log(`  [PROFIT_FAIL] ${userShort}... no route`);
+                log(config, `  [PROFIT_FAIL] ${userShort}... no route`);
               }
             }
           } else {
-            console.log(`  [SIM_FAIL] ${userShort}... ${pair}: ${simResult.error}`);
+            log(config, `  [SIM_FAIL] ${userShort}... ${pair}: ${simResult.error}`);
             addToCooldown(plan.liquidation.marketId, plan.liquidation.user, `Sim failed: ${simResult.error}`, 'fail');
           }
         } catch (error) {
           metrics.errorsCount++;
-          console.log(`  [SIM_ERROR] ${userShort}... ${pair}: ${error.message}`);
+          log(config, `  [SIM_ERROR] ${userShort}... ${pair}: ${error.message}`);
           addToCooldown(plan.liquidation.marketId, plan.liquidation.user, `Sim error: ${error.message}`, 'fail');
         }
       }
@@ -489,7 +556,7 @@ async function runTick(ctx) {
       }
     }
 
-    console.log(`[Simulate] Summary: ${metrics.simSuccessCount}/${metrics.simulatedCount} succeeded, ${metrics.profitOkCount} profitable`);
+    log(config, `[Simulate] Summary: ${metrics.simSuccessCount}/${metrics.simulatedCount} succeeded, ${metrics.profitOkCount} profitable`);
 
     // Check for liquidatable trigger
     if (metrics.liquidatableCount > 0) {
@@ -538,6 +605,9 @@ async function runTick(ctx) {
               }
             : undefined;
 
+          // Add tickId to plan for logging
+          plan.tickId = tickId;
+          
           const result = await dispatchExecution(
             executionClients.walletClient,
             executionClients.publicClient,
@@ -561,7 +631,7 @@ async function runTick(ctx) {
             );
 
             const okTag = config.executionMode === 'flashloan' ? 'FLASH_OK' : 'EXEC_OK';
-            console.log(`  [${okTag}] ${liquidation.user} TX: ${result.hash}`);
+            log(config, `  [${okTag}] ${liquidation.user} TX: ${result.hash}`);
 
             // Telegram success notification
             if (telegramClient) {
@@ -585,7 +655,7 @@ async function runTick(ctx) {
             addToCooldown(liquidation.marketId, liquidation.user, `Exec failed: ${result.error}`, 'execFail');
 
             const failTag = config.executionMode === 'flashloan' ? 'FLASH_FAIL' : 'EXEC_FAIL';
-            console.log(`  [${failTag}] ${liquidation.user} ${result.error}`);
+            log(config, `  [${failTag}] ${liquidation.user} ${result.error}`);
 
             // Telegram failure notification
             if (telegramClient) {
@@ -611,12 +681,46 @@ async function runTick(ctx) {
       }
     }
 
-    return metrics;
+    // Emit tick_end event with summary
+    const durationMs = Date.now() - tickStartTime;
+    // Calculate confirmedHealthy: candidates checked minus liquidatable (assuming rest are healthy or errors)
+    const confirmedHealthy = Math.max(0, metrics.confirmedCount - metrics.liquidatableCount);
+    const summary = {
+      candidatesTotal: metrics.fetchedCandidates,
+      confirmedChecked: metrics.confirmedCount,
+      confirmedLiquidatable: metrics.liquidatableCount,
+      confirmedHealthy,
+      confirmedErrors: metrics.confirmedErrors || 0,
+      filteredPassed: metrics.liquidatableCount,
+      filteredCooldown: metrics.filteredCooldown,
+      filteredCap: metrics.filteredCap,
+      filteredDust: metrics.filteredDust,
+      executedSent: metrics.executedCount,
+      executedSuccess: metrics.execSuccessCount,
+      executedFail: metrics.executedCount - metrics.execSuccessCount,
+    };
+    
+    emitEvent(config, {
+      type: 'tick_end',
+      tickId,
+      mode,
+      durationMs,
+      summary,
+    });
+
+    return { ...metrics, durationMs };
 
   } catch (error) {
-    console.error(`Tick error: ${error.message}`);
+    const durationMs = Date.now() - tickStartTime;
+    logError(config, `Tick error: ${error.message}`, error);
+    emitEvent(config, {
+      type: 'error',
+      tickId,
+      mode,
+      message: error.message,
+    });
     metrics.errorsCount++;
-    return metrics;
+    return { ...metrics, durationMs };
   }
 }
 
@@ -647,7 +751,7 @@ async function initializeExecutionClients(config) {
     return null;
   }
 
-  console.log('\nInitializing execution clients...');
+  log(config, '\nInitializing execution clients...');
   const executionClients = createExecutionClients(config);
   const activeExecutor = getActiveExecutorAddress(config);
 
@@ -660,11 +764,13 @@ async function initializeExecutionClients(config) {
     );
 
     if (!verification.valid) {
-      console.error(`\n❌ Flashloan executor verification failed:`);
-      verification.errors.forEach(e => console.error(`  - ${e}`));
+      logError(config, `\n❌ Flashloan executor verification failed:`);
+      if (!isJsonlEnabled(config)) {
+        verification.errors.forEach(e => console.error(`  - ${e}`));
+      }
       process.exit(1);
     }
-    console.log(`✓ Flashloan executor verified. Owner: ${verification.owner}, Morpho: ${verification.morpho}`);
+    log(config, `✓ Flashloan executor verified. Owner: ${verification.owner}, Morpho: ${verification.morpho}`);
   } else {
     const isOwner = await verifyExecutorOwnership(
       executionClients.publicClient,
@@ -673,10 +779,10 @@ async function initializeExecutionClients(config) {
     );
 
     if (!isOwner) {
-      console.error(`\n❌ Bot account ${executionClients.account.address} is not owner of executor ${activeExecutor}`);
+      logError(config, `\n❌ Bot account ${executionClients.account.address} is not owner of executor ${activeExecutor}`);
       process.exit(1);
     }
-    console.log(`✓ Executor ownership verified. Bot: ${executionClients.account.address}`);
+    log(config, `✓ Executor ownership verified. Bot: ${executionClients.account.address}`);
   }
 
   return executionClients;
@@ -725,11 +831,12 @@ async function main() {
 
     // Run once or start scheduler
     if (config.runOnce) {
-      console.log('\n[RUN_ONCE=1] Running single tick...\n');
+      log(config, '\n[RUN_ONCE=1] Running single tick...\n');
+      ctx._tickCounter = 1; // Set tick counter for runOnce mode
       const metrics = await runTick(ctx);
-      console.log('\n✓ Single tick complete');
-      console.log(`  Candidates: ${metrics.fetchedCandidates}, Confirmed: ${metrics.confirmedCount}, Liquidatable: ${metrics.liquidatableCount}`);
-      console.log(`  Simulated: ${metrics.simSuccessCount}/${metrics.simulatedCount}, Executed: ${metrics.execSuccessCount}/${metrics.executedCount}`);
+      log(config, '\n✓ Single tick complete');
+      log(config, `  Candidates: ${metrics.fetchedCandidates}, Confirmed: ${metrics.confirmedCount}, Liquidatable: ${metrics.liquidatableCount}`);
+      log(config, `  Simulated: ${metrics.simSuccessCount}/${metrics.simulatedCount}, Executed: ${metrics.execSuccessCount}/${metrics.executedCount}`);
       process.exit(0);
     } else {
       // Start scheduler with cleanup callback
@@ -746,15 +853,15 @@ async function main() {
     }
 
   } catch (error) {
-    console.error('\n❌ Error:', error.message);
-    console.error(error.stack);
+    logError(config, '\n❌ Error:', error);
+    if (!isJsonlEnabled(config)) {
+      if (error.message.includes('fetch') || error.message.includes('ECONNREFUSED')) {
+        console.error('\n💡 Network error: check RPC and API connectivity.');
+      }
 
-    if (error.message.includes('fetch') || error.message.includes('ECONNREFUSED')) {
-      console.error('\n💡 Network error: check RPC and API connectivity.');
-    }
-
-    if (error.message.includes('EXECUTOR_ADDRESS') || error.message.includes('PRIVATE_KEY')) {
-      console.error('\n💡 Configuration error: check required env vars for execution mode.');
+      if (error.message.includes('EXECUTOR_ADDRESS') || error.message.includes('PRIVATE_KEY')) {
+        console.error('\n💡 Configuration error: check required env vars for execution mode.');
+      }
     }
 
     process.exit(1);

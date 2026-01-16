@@ -201,6 +201,9 @@ function getConfig() {
     
     // Health server
     healthPort: parseInt(process.env.HEALTH_PORT || '4001', 10),
+    
+    // Logging format
+    logFormat: (process.env.LOG_FORMAT || 'pretty').toLowerCase(), // 'pretty' or 'jsonl'
   };
   
   // Validate if execution is enabled

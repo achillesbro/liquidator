@@ -6,6 +6,7 @@
 
 const { createPublicClient, http, parseAbi, encodeFunctionData, decodeFunctionResult } = require('viem');
 const { Market, MarketConfig, AccrualPosition, MarketUtils, MathLib } = require('@morpho-org/blue-sdk');
+const { isJsonlEnabled, log } = require('./logger');
 
 /**
  * Format BigInt for display
@@ -249,11 +250,15 @@ async function confirmLiquidatable(client, morphoBlueAddress, candidate, config 
       });
       
       if (!oraclePrice || oraclePrice === 0n) {
-        console.warn(`  ⚠ Zero oracle price for ${candidate.loanSymbol}/${candidate.collateralSymbol}`);
+        if (!isJsonlEnabled(config)) {
+          console.warn(`  ⚠ Zero oracle price for ${candidate.loanSymbol}/${candidate.collateralSymbol}`);
+        }
         return null;
       }
     } catch (e) {
-      console.warn(`  ⚠ Oracle error for ${candidate.loanSymbol}/${candidate.collateralSymbol}: ${e.shortMessage || e.message}`);
+      if (!isJsonlEnabled(config)) {
+        console.warn(`  ⚠ Oracle error for ${candidate.loanSymbol}/${candidate.collateralSymbol}: ${e.shortMessage || e.message}`);
+      }
       return null;
     }
     
@@ -283,7 +288,7 @@ async function confirmLiquidatable(client, morphoBlueAddress, candidate, config 
     const isLiquidatable = borrowAssets > maxBorrow;
     
     // Debug logging for test mode
-    if (config.testMode && isLiquidatable) {
+    if (config.testMode && isLiquidatable && !isJsonlEnabled(config)) {
       console.log(`\n  🔍 At-risk position found (TEST MODE):`);
       console.log(`    Market: ${candidate.loanSymbol}/${candidate.collateralSymbol}`);
       console.log(`    User: ${candidate.user}`);
@@ -364,10 +369,10 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
   
   const toConfirm = candidates.slice(0, maxToConfirm);
   
-  if (config.testMode) {
+  if (config.testMode && !isJsonlEnabled(config)) {
     console.log(`\n🧪 TEST MODE: Using ${config.testLltvMultiplier * 100}% of actual LLTV to find at-risk positions`);
   }
-  console.log(`\nChecking ${toConfirm.length} candidates onchain (with Multicall3)...`);
+  log(config, `\nChecking ${toConfirm.length} candidates onchain (with Multicall3)...`);
   
   let checked = 0;
   let healthy = 0;
@@ -381,7 +386,7 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
     const batchNum = Math.floor(i / batchSize) + 1;
     const totalBatches = Math.ceil(toConfirm.length / batchSize);
     
-    console.log(`  Batch ${batchNum}/${totalBatches} (${batch.length} positions)...`);
+    log(config, `  Batch ${batchNum}/${totalBatches} (${batch.length} positions)...`);
     
     try {
       // Fetch all position data in one multicall
@@ -452,7 +457,7 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
         const seizableCollateral = accrualPosition.seizableCollateral ?? 0n;
         const isLiquidatable = seizableCollateral > 0n;
         
-        if (config.testMode && isLiquidatable) {
+        if (config.testMode && isLiquidatable && !isJsonlEnabled(config)) {
           const borrowAssets = totalBorrowShares > 0n
             ? (borrowShares * totalBorrowAssets) / totalBorrowShares
             : 0n;
@@ -511,7 +516,7 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
             collateralDecimals: candidate.collateralDecimals,
           });
           
-          if (!config.testMode) {
+          if (!config.testMode && !isJsonlEnabled(config)) {
             console.log(`    ✓ Liquidatable: ${candidate.user} ${candidate.loanSymbol}/${candidate.collateralSymbol}`);
           }
         } else {
@@ -520,17 +525,22 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
       }
     } catch (error) {
       rpcErrors += batch.length;
-      console.warn(`    ✗ Batch error: ${error.shortMessage || error.message}`);
+      if (!isJsonlEnabled(config)) {
+        console.warn(`    ✗ Batch error: ${error.shortMessage || error.message}`);
+      }
     }
   }
   
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
   
-  console.log(`\n${config.testMode ? '🧪 Test mode' : ''} Confirmation summary:`);
-  console.log(`  Checked: ${checked}/${toConfirm.length} in ${elapsed}s (${(checked / parseFloat(elapsed)).toFixed(1)} pos/s)`);
-  console.log(`  ${config.testMode ? 'At-risk' : 'Liquidatable'}: ${confirmed.length}`);
-  console.log(`  Healthy: ${healthy}`);
-  console.log(`  Errors: ${rpcErrors}`);
+  // Suppress confirmation summary in jsonl mode
+  if (!isJsonlEnabled(config)) {
+    console.log(`\n${config.testMode ? '🧪 Test mode' : ''} Confirmation summary:`);
+    console.log(`  Checked: ${checked}/${toConfirm.length} in ${elapsed}s (${(checked / parseFloat(elapsed)).toFixed(1)} pos/s)`);
+    console.log(`  ${config.testMode ? 'At-risk' : 'Liquidatable'}: ${confirmed.length}`);
+    console.log(`  Healthy: ${healthy}`);
+    console.log(`  Errors: ${rpcErrors}`);
+  }
   
   return confirmed;
 }
