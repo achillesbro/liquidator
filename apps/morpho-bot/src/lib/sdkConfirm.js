@@ -298,33 +298,26 @@ async function confirmLiquidatable(client, morphoBlueAddress, candidate, config 
     }
     
     // Calculate liquidation amounts
-    // Morpho Blue allows liquidating up to the amount that brings position back to healthy
-    // For simplicity, we calculate max seizable collateral and corresponding repay
+    // Use seizableCollateral from SDK - this is the amount needed to restore health
+    // We pass seizedAssets to Morpho (repaidShares = 0), Morpho calculates repay internally
+    const WAD = 10n ** 18n;
     
-    // Close factor: typically can liquidate up to 100% if severely underwater
-    // For this implementation, we'll use a conservative 50% or full if needed
-    const excessDebt = borrowAssets - maxBorrow;
-    const liquidationIncentive = 10n ** 17n; // 10% incentive (0.1 in 18 decimals)
-    
-    // Repay amount: min(borrowAssets, excessDebt * 2) to be conservative
-    const repayShares = borrowShares / 2n; // Liquidate up to 50%
-    const repayAssets = (repayShares * totalBorrowAssets) / totalBorrowShares;
-    
-    // Seizable collateral = repayAssets * (1 + incentive) / price
-    // To convert loan tokens to collateral: collateral = loanTokens * ORACLE_PRICE_SCALE / oraclePrice
-    const repayValue = repayAssets;
-    const seizeValue = repayValue + (repayValue * liquidationIncentive) / (10n ** 18n);
-    const seizeAssets = (seizeValue * ORACLE_PRICE_SCALE) / oraclePrice;
-    
-    // Cap seize amount to available collateral
-    let finalSeizeAssets = seizeAssets > collateral ? collateral : seizeAssets;
+    // Calculate seizableCollateral: amount needed to restore health + incentive
+    const seizableValue = borrowAssets > maxBorrow ? borrowAssets - maxBorrow : 0n;
+    const liquidationIncentiveFactor = WAD * WAD / lltv;
+    const seizableWithIncentive = seizableValue * liquidationIncentiveFactor / WAD;
+    const seizableCollateral = seizableWithIncentive * ORACLE_PRICE_SCALE / oraclePrice;
     
     // Apply seize buffer to avoid rounding/timing issues
-    // seizeBufferBps is passed via config (default 5 bps = 0.05%)
     const seizeBufferBps = config?.seizeBufferBps || 5;
-    if (seizeBufferBps > 0) {
+    let finalSeizeAssets = seizableCollateral > collateral ? collateral : seizableCollateral;
+    if (seizeBufferBps > 0 && finalSeizeAssets > 0n) {
       finalSeizeAssets = finalSeizeAssets - (finalSeizeAssets * BigInt(seizeBufferBps)) / 10000n;
     }
+    
+    // Calculate repayAssets from seizeAssets (for flashloan sizing)
+    const seizeValueInLoan = finalSeizeAssets * oraclePrice / ORACLE_PRICE_SCALE;
+    const repayAssets = seizeValueInLoan * WAD / liquidationIncentiveFactor;
     
     return {
       marketId,
@@ -342,8 +335,7 @@ async function confirmLiquidatable(client, morphoBlueAddress, candidate, config 
       oraclePrice,
       maxBorrow,
       isLiquidatable: true,
-      repayShares,
-      repayAssets,
+      repayAssets, // Estimated for flashloan sizing
       seizeAssets: finalSeizeAssets,
       loanSymbol: candidate.loanSymbol,
       collateralSymbol: candidate.collateralSymbol,
@@ -478,31 +470,23 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
         }
         
         if (isLiquidatable) {
-          // Calculate liquidation amounts
-          // Liquidate up to 50% of the position
-          const repayShares = borrowShares / 2n;
-          const repayAssets = totalBorrowShares > 0n
-            ? (repayShares * totalBorrowAssets) / totalBorrowShares
-            : 0n;
-          
-          // Calculate seizeAssets from repayAssets (must be consistent!)
-          // seizeAssets = repayAssets * (1 + liquidationIncentive) * ORACLE_PRICE_SCALE / oraclePrice
-          // liquidationIncentive = 1 / LLTV - 1 (standard Morpho formula)
+          // Use SDK's seizableCollateral - this is the amount needed to restore health
+          // We pass seizedAssets to Morpho (repaidShares = 0), Morpho calculates repay internally
           const ORACLE_PRICE_SCALE = 10n ** 36n;
           const WAD = 10n ** 18n;
-          const liquidationIncentiveFactor = WAD + MathLib.wDivDown(WAD - lltv, lltv); // 1 + (1-lltv)/lltv = 1/lltv
-          const seizeValue = MathLib.wMulDown(repayAssets, liquidationIncentiveFactor);
-          let calculatedSeizeAssets = (seizeValue * ORACLE_PRICE_SCALE) / oraclePrice;
-          
-          // Cap to available collateral and seizableCollateral
-          let finalSeizeAssets = MathLib.min(calculatedSeizeAssets, MathLib.min(seizableCollateral, collateral));
           
           // Apply seize buffer to avoid rounding/timing issues
-          // seizeBufferBps is passed via config (default 5 bps = 0.05%)
           const seizeBufferBps = config?.seizeBufferBps || 5;
+          let finalSeizeAssets = MathLib.min(seizableCollateral, collateral);
           if (seizeBufferBps > 0 && finalSeizeAssets > 0n) {
             finalSeizeAssets = finalSeizeAssets - (finalSeizeAssets * BigInt(seizeBufferBps)) / 10000n;
           }
+          
+          // Calculate repayAssets from seizeAssets (for flashloan sizing)
+          // repayAssets = seizeAssets * oraclePrice / ORACLE_PRICE_SCALE / liquidationIncentiveFactor
+          const liquidationIncentiveFactor = WAD * WAD / lltv; // 1/lltv (e.g., 1.6 for 62.5% LLTV)
+          const seizeValueInLoan = finalSeizeAssets * oraclePrice / ORACLE_PRICE_SCALE;
+          const repayAssets = seizeValueInLoan * WAD / liquidationIncentiveFactor;
           
           confirmed.push({
             marketId: candidate.marketId,
@@ -519,8 +503,7 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
               { lltv: effectiveLltv }
             ),
             isLiquidatable: true,
-            repayShares,
-            repayAssets,
+            repayAssets, // Estimated for flashloan sizing (Morpho calculates actual from seizeAssets)
             seizeAssets: finalSeizeAssets,
             loanSymbol: candidate.loanSymbol,
             collateralSymbol: candidate.collateralSymbol,
