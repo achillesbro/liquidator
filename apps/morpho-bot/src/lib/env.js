@@ -134,8 +134,12 @@ function getConfig() {
     maxFeeGwei: process.env.MAX_FEE_GWEI ? parseFloat(process.env.MAX_FEE_GWEI) : null,
     
     // Telegram notifications (optional)
+    telegramEnabled: parseInt(process.env.TELEGRAM_ENABLED || '0', 10) === 1,
     telegramToken: process.env.TELEGRAM_TOKEN || '',
-    telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
+    telegramChatId: process.env.TELEGRAM_CHAT_ID || '1286009814', // Default chat ID
+    telegramSendOnSent: parseInt(process.env.TELEGRAM_SEND_ON_SENT || '0', 10) === 1,
+    telegramRateLimitSeconds: parseInt(process.env.TELEGRAM_RATE_LIMIT_SECONDS || '30', 10),
+    telegramMaxPerHour: parseInt(process.env.TELEGRAM_MAX_PER_HOUR || '60', 10),
     
     // Milestone 2 configuration
     maxCandidates: parseInt(process.env.MAX_CANDIDATES || '100', 10),
@@ -194,6 +198,9 @@ function getConfig() {
     
     // Run mode
     runOnce: parseInt(process.env.RUN_ONCE || '0', 10) === 1,
+    
+    // Health server
+    healthPort: parseInt(process.env.HEALTH_PORT || '4001', 10),
   };
   
   // Validate if execution is enabled

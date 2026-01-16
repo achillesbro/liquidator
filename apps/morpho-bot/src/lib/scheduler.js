@@ -3,6 +3,8 @@
  * Handles timing, mode transitions, and metrics tracking
  */
 
+const { updateHealthState, markReady } = require('./health');
+
 /**
  * Tick metrics structure
  * @typedef {Object} TickMetrics
@@ -93,8 +95,9 @@ class Scheduler {
    * Run scheduler loop
    * @param {Function} runTick - Async function that runs a single tick: (ctx) => Promise<TickMetrics>
    * @param {Object} ctx - Context object passed to runTick
+   * @param {Function} onShutdown - Optional cleanup function called before shutdown: () => Promise<void>
    */
-  async runScheduler(runTick, ctx) {
+  async runScheduler(runTick, ctx, onShutdown) {
     this.isRunning = true;
     this.shutdownRequested = false;
 
@@ -119,6 +122,15 @@ class Scheduler {
 
       if (this.currentTick) {
         console.log('⚠ Current tick did not finish in time. Forcing exit.');
+      }
+
+      // Call cleanup callback if provided
+      if (onShutdown) {
+        try {
+          await onShutdown();
+        } catch (error) {
+          console.error('Cleanup error:', error.message);
+        }
       }
 
       this.isRunning = false;
@@ -195,11 +207,30 @@ class Scheduler {
       const metrics = await runTick(ctx);
       const durationMs = Date.now() - startTime;
 
+      // Update health state on success
+      updateHealthState({
+        lastTickAt: new Date().toISOString(),
+        lastTickDurationMs: durationMs,
+        mode: this.mode,
+      });
+      markReady();
+
       return {
         ...metrics,
         durationMs,
       };
     } catch (error) {
+      const durationMs = Date.now() - startTime;
+      
+      // Update health state on error
+      updateHealthState({
+        lastTickAt: new Date().toISOString(),
+        lastTickDurationMs: durationMs,
+        lastErrorAt: new Date().toISOString(),
+        mode: this.mode,
+      });
+      markReady(); // Still mark ready - tick ran, just errored
+
       return {
         fetchedVaults: 0,
         fetchedMarkets: 0,
@@ -212,7 +243,7 @@ class Scheduler {
         executedCount: 0,
         execSuccessCount: 0,
         errorsCount: 1,
-        durationMs: Date.now() - startTime,
+        durationMs,
         triggers: {},
       };
     }

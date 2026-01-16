@@ -11,12 +11,17 @@
     "morpho:bot": "pnpm --filter @apps/morpho-bot start",
     "morpho:bot:dry": "EXECUTION_ENABLED=0 pnpm --filter @apps/morpho-bot start",
     "morpho:bot:exec": "EXECUTION_ENABLED=1 pnpm --filter @apps/morpho-bot start",
+    "morpho:test:telegram": "pnpm --filter @apps/morpho-bot test:telegram",
     "morpho:deploy": "pnpm --filter @packages/executors hardhat:deploy:morpho",
     "ponder:db": "docker-compose -f apps/ponder/docker-compose.yml up -d",
     "ponder:db:down": "docker-compose -f apps/ponder/docker-compose.yml down -v",
     "ponder:start": "pnpm --filter @apps/ponder start -- --schema public",
     "ponder:dev": "pnpm ponder:db && pnpm ponder:start",
-    "ponder:health": "node apps/ponder/scripts/healthcheck.js"
+    "ponder:health": "node apps/ponder/scripts/healthcheck.js",
+    "docker:morpho:build": "docker compose -f deploy/docker-compose.morpho.yml build",
+    "docker:morpho:up": "docker compose -f deploy/docker-compose.morpho.yml up -d --build",
+    "docker:morpho:logs": "docker compose -f deploy/docker-compose.morpho.yml logs -f --tail=200",
+    "docker:morpho:down": "docker compose -f deploy/docker-compose.morpho.yml down"
   },
   "devDependencies": {}
 }

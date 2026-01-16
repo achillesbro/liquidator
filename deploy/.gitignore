@@ -1,0 +1,4 @@
+# Secrets - NEVER commit
+.env.morpho
+.env.*
+!env.*.template

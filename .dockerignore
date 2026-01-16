@@ -1,0 +1,47 @@
+# Dependencies (will be installed fresh in container)
+**/node_modules
+
+# Environment files (secrets)
+**/.env
+**/.env.*
+!**/env.*.template
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Build artifacts
+**/dist
+**/build
+**/.cache
+**/coverage
+
+# Ponder (not needed for morpho-bot)
+apps/ponder
+
+# Documentation
+*.md
+!deploy/README.md
+
+# Test files
+**/tests
+**/*.test.js
+**/*.spec.js
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Deploy secrets
+deploy/.env.*
+!deploy/env.*.template

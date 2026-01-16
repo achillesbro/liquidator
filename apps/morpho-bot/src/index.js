@@ -37,13 +37,13 @@ const {
   clearCooldown,
   checkRepayCap,
   checkSlippage,
-  sendTelegramNotification,
-  formatSuccessNotification,
-  formatFailureNotification,
 } = require('./lib/operations');
+const { createTelegramClient } = require('./lib/telegram');
+const { formatSuccess, formatSent, formatFail } = require('./lib/telegramFormat');
 const cache = require('./lib/cache');
 const { CandidateBacklog } = require('./lib/backlog');
 const { Scheduler } = require('./lib/scheduler');
+const { createHealthServer, updateHealthState } = require('./lib/health');
 
 /**
  * Format bigint for display
@@ -516,13 +516,35 @@ async function runTick(ctx) {
             args: [config.treasuryAddress],
           });
 
-          // Execute
+          // Get Telegram client from context
+          const telegramClient = ctx.telegramClient;
+
+          // Execute with onSent callback for Telegram
+          let txHash = null;
+          const onSent = config.telegramSendOnSent && telegramClient
+            ? async (hash) => {
+                txHash = hash;
+                const mode = config.executionMode === 'flashloan' ? 'FLASHLOAN' : 'PREFUND';
+                const message = formatSent({
+                  chainId: config.chainId,
+                  mode,
+                  marketId: liquidation.marketId,
+                  user: liquidation.user,
+                  loanToken: liquidation.loanSymbol,
+                  collateralToken: liquidation.collateralSymbol,
+                  txHash: hash,
+                });
+                await telegramClient.send(hash, message, { dedupeKey: hash });
+              }
+            : undefined;
+
           const result = await dispatchExecution(
             executionClients.walletClient,
             executionClients.publicClient,
             plan,
             config,
-            plan.simulationResult
+            plan.simulationResult,
+            onSent
           );
 
           if (result.success) {
@@ -541,13 +563,22 @@ async function runTick(ctx) {
             const okTag = config.executionMode === 'flashloan' ? 'FLASH_OK' : 'EXEC_OK';
             console.log(`  [${okTag}] ${liquidation.user} TX: ${result.hash}`);
 
-            // Telegram notification
-            if (config.telegramToken && config.telegramChatId) {
-              await sendTelegramNotification(
-                config.telegramToken,
-                config.telegramChatId,
-                formatSuccessNotification(result, plan, profitInfo)
-              );
+            // Telegram success notification
+            if (telegramClient) {
+              const mode = config.executionMode === 'flashloan' ? 'FLASHLOAN' : 'PREFUND';
+              const message = formatSuccess({
+                chainId: config.chainId,
+                mode,
+                marketId: liquidation.marketId,
+                user: liquidation.user,
+                loanToken: liquidation.loanSymbol,
+                collateralToken: liquidation.collateralSymbol,
+                repayAssets: liquidation.repayAssets,
+                loanDecimals: liquidation.loanDecimals,
+                profitAssets: profitInfo,
+                txHash: result.hash,
+              });
+              await telegramClient.send(result.hash, message, { dedupeKey: result.hash });
             }
           } else {
             metrics.errorsCount++;
@@ -556,13 +587,21 @@ async function runTick(ctx) {
             const failTag = config.executionMode === 'flashloan' ? 'FLASH_FAIL' : 'EXEC_FAIL';
             console.log(`  [${failTag}] ${liquidation.user} ${result.error}`);
 
-            // Telegram notification
-            if (config.telegramToken && config.telegramChatId) {
-              await sendTelegramNotification(
-                config.telegramToken,
-                config.telegramChatId,
-                formatFailureNotification(result, plan, config.executionMode)
-              );
+            // Telegram failure notification
+            if (telegramClient) {
+              const dedupeKey = result.hash || `${liquidation.marketId}:${liquidation.user}:${Math.floor(Date.now() / 60000)}`; // Per-minute bucket
+              const mode = config.executionMode === 'flashloan' ? 'FLASHLOAN' : 'PREFUND';
+              const message = formatFail({
+                reason: result.error || 'Unknown error',
+                txHash: result.hash,
+                marketId: liquidation.marketId,
+                user: liquidation.user,
+                mode,
+                chainId: config.chainId,
+                loanToken: liquidation.loanSymbol,
+                collateralToken: liquidation.collateralSymbol,
+              });
+              await telegramClient.send(dedupeKey, message, { dedupeKey });
             }
           }
         } catch (error) {
@@ -579,6 +618,25 @@ async function runTick(ctx) {
     metrics.errorsCount++;
     return metrics;
   }
+}
+
+/**
+ * Initialize Telegram client
+ * @param {Object} config - Configuration
+ * @returns {Object|null} Telegram client or null
+ */
+function initializeTelegramClient(config) {
+  if (!config.telegramEnabled || !config.telegramToken || !config.telegramChatId) {
+    return null;
+  }
+
+  return createTelegramClient({
+    token: config.telegramToken,
+    chatId: config.telegramChatId,
+    enabled: config.telegramEnabled,
+    rateLimitSeconds: config.telegramRateLimitSeconds,
+    maxPerHour: config.telegramMaxPerHour,
+  });
 }
 
 /**
@@ -635,8 +693,19 @@ async function main() {
     // Print startup banner
     printStartupBanner(config);
 
+    // Start health server
+    const healthServer = createHealthServer(config.healthPort);
+    updateHealthState({
+      executionEnabled: config.executionEnabled,
+      mode: 'BASE',
+      tickBaseSeconds: config.tickBaseSeconds,
+    });
+
     // Initialize execution clients if needed
     const executionClients = await initializeExecutionClients(config);
+
+    // Initialize Telegram client
+    const telegramClient = initializeTelegramClient(config);
 
     // Initialize backlog
     const backlog = new CandidateBacklog(config);
@@ -646,7 +715,13 @@ async function main() {
       config,
       executionClients,
       backlog,
+      telegramClient,
     };
+
+    // Send startup notification
+    if (telegramClient) {
+      await telegramClient.send('bot_start', '🤖 BOT START', { force: true });
+    }
 
     // Run once or start scheduler
     if (config.runOnce) {
@@ -657,9 +732,17 @@ async function main() {
       console.log(`  Simulated: ${metrics.simSuccessCount}/${metrics.simulatedCount}, Executed: ${metrics.execSuccessCount}/${metrics.executedCount}`);
       process.exit(0);
     } else {
-      // Start scheduler
+      // Start scheduler with cleanup callback
       const scheduler = new Scheduler(config);
-      await scheduler.runScheduler(runTick, ctx);
+      
+      const onShutdown = async () => {
+        if (telegramClient) {
+          await telegramClient.send('bot_stop', '🛑 BOT STOP', { force: true });
+          telegramClient.cleanup();
+        }
+      };
+      
+      await scheduler.runScheduler(runTick, ctx, onShutdown);
     }
 
   } catch (error) {
