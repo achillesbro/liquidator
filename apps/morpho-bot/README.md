@@ -214,10 +214,14 @@ Uses pre-funded executor with loan tokens.
 | `MAX_FEE_GWEI` | none | Max gas price in gwei |
 
 ### Telegram Notifications (Optional)
-| Variable | Description |
-|----------|-------------|
-| `TELEGRAM_TOKEN` | Bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | Chat ID for notifications |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TELEGRAM_ENABLED` | `0` | Set to `1` to enable notifications |
+| `TELEGRAM_TOKEN` | - | Bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | `1286009814` | Chat ID for notifications |
+| `TELEGRAM_SEND_ON_SENT` | `0` | Set to `1` to send notification when tx is broadcast |
+| `TELEGRAM_RATE_LIMIT_SECONDS` | `30` | Minimum seconds between messages |
+| `TELEGRAM_MAX_PER_HOUR` | `60` | Maximum messages per hour |
 
 ## Architecture
 
@@ -235,6 +239,8 @@ apps/morpho-bot/
 │       ├── simulate.js       # Simulation logic
 │       ├── execute.js        # Execution dispatcher (prefund + flashloan)
 │       ├── operations.js     # Cooldowns, caps, notifications
+│       ├── telegram.js       # Telegram client with rate limiting
+│       ├── telegramFormat.js # Telegram message formatting
 │       ├── report.js         # CLI output formatter
 │       └── retry.js          # HTTP retry utility
 ├── package.json
@@ -354,6 +360,55 @@ Check the revert reason. Common causes:
 
 ### "Gas price exceeds limit"
 Network is congested. Wait or increase `MAX_FEE_GWEI`.
+
+## Telegram Alerts
+
+The bot can send Telegram notifications for liquidation events. Configure via environment variables:
+
+### Setup
+
+1. **Create a Telegram bot**:
+   - Message [@BotFather](https://t.me/BotFather) on Telegram
+   - Use `/newbot` command and follow instructions
+   - Save the bot token
+
+2. **Get your chat ID**:
+   - Start a chat with your bot
+   - Send a message to your bot
+   - Visit `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
+   - Find your chat ID in the response (or use the default: `1286009814`)
+
+3. **Configure environment variables**:
+   ```env
+   TELEGRAM_ENABLED=1
+   TELEGRAM_TOKEN=your_bot_token_here
+   TELEGRAM_CHAT_ID=1286009814
+   TELEGRAM_SEND_ON_SENT=0  # Optional: send when tx is broadcast
+   TELEGRAM_RATE_LIMIT_SECONDS=30  # Optional: min seconds between messages
+   TELEGRAM_MAX_PER_HOUR=60  # Optional: max messages per hour
+   ```
+
+### Notification Events
+
+- **Bot Start**: Sent once when bot starts (if `TELEGRAM_ENABLED=1`)
+- **Bot Stop**: Sent once when bot stops gracefully (SIGINT/SIGTERM)
+- **Transaction Sent** (optional): Sent when liquidation tx is broadcast (if `TELEGRAM_SEND_ON_SENT=1`)
+- **Success**: Sent when liquidation tx is confirmed successfully
+- **Failure**: Sent when liquidation tx fails (revert, dropped, timeout)
+
+### Rate Limiting & Deduplication
+
+- **Deduplication**: Messages are deduplicated by transaction hash (6-hour TTL)
+- **Rate Limiting**: 
+  - No more than 1 message per `TELEGRAM_RATE_LIMIT_SECONDS` (default: 30s)
+  - No more than `TELEGRAM_MAX_PER_HOUR` per hour (default: 60)
+- **Silent Failures**: If rate-limited or API errors occur, messages are dropped silently (no crash)
+
+### Safety
+
+- Bot token is never logged or printed
+- Default chat ID is `1286009814` (as specified)
+- If `TELEGRAM_ENABLED=0` or token/chat ID missing, all Telegram calls are no-ops
 
 ## Milestones
 

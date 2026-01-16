@@ -7,6 +7,7 @@
     "start": "node src/index.js",
     "dry-run": "EXECUTION_ENABLED=0 node src/index.js",
     "execute": "EXECUTION_ENABLED=1 node src/index.js",
+    "test:telegram": "node tests/test-telegram.js",
     "test:flashloan-noop": "node tests/test-flashloan-noop.js",
     "test:liquidswap-swap": "node tests/test-liquidswap-swap.js",
     "test:flashloan-swap": "node tests/test-flashloan-swap.js"

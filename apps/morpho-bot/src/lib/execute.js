@@ -188,9 +188,10 @@ async function simulateExecutorCall(publicClient, plan, config) {
  * @param {Object} plan - Execution plan from buildCallsForExecutor
  * @param {Object} config - Configuration
  * @param {Object} simulationResult - Result from simulateExecutorCall
+ * @param {Function} onSent - Optional callback when tx hash is known: (hash) => void
  * @returns {Promise<Object>} Execution result
  */
-async function executeViaExecutor(walletClient, publicClient, plan, config, simulationResult) {
+async function executeViaExecutor(walletClient, publicClient, plan, config, simulationResult, onSent) {
   const { executorAddress } = config;
   const { formattedCalls, gasEstimate } = simulationResult;
   
@@ -218,6 +219,11 @@ async function executeViaExecutor(walletClient, publicClient, plan, config, simu
     });
     
     console.log(`[EXEC_SENT] tx: ${hash}`);
+    
+    // Call onSent callback if provided
+    if (onSent) {
+      onSent(hash);
+    }
     
     // Wait for receipt
     const receipt = await publicClient.waitForTransactionReceipt({
@@ -549,9 +555,10 @@ async function simulateFlashloanCall(publicClient, plan, config) {
  * @param {Object} plan - Flashloan execution plan
  * @param {Object} config - Configuration
  * @param {Object} simulationResult - Result from simulateFlashloanCall
+ * @param {Function} onSent - Optional callback when tx hash is known: (hash) => void
  * @returns {Promise<Object>} Execution result
  */
-async function executeViaFlashloan(walletClient, publicClient, plan, config, simulationResult) {
+async function executeViaFlashloan(walletClient, publicClient, plan, config, simulationResult, onSent) {
   const executorAddress = config.flashloanExecutorAddress;
   const { formattedCalls, gasEstimate, flashloanToken, flashloanAssets } = simulationResult;
   
@@ -585,6 +592,11 @@ async function executeViaFlashloan(walletClient, publicClient, plan, config, sim
     });
     
     console.log(`[FLASH_SENT] tx: ${hash}`);
+    
+    // Call onSent callback if provided
+    if (onSent) {
+      onSent(hash);
+    }
     
     // Wait for receipt
     const receipt = await publicClient.waitForTransactionReceipt({
@@ -628,13 +640,14 @@ async function executeViaFlashloan(walletClient, publicClient, plan, config, sim
  * @param {Object} plan - Execution plan
  * @param {Object} config - Configuration
  * @param {Object} simulationResult - Simulation result
+ * @param {Function} onSent - Optional callback when tx hash is known: (hash) => void
  * @returns {Promise<Object>} Execution result
  */
-async function dispatchExecution(walletClient, publicClient, plan, config, simulationResult) {
+async function dispatchExecution(walletClient, publicClient, plan, config, simulationResult, onSent) {
   if (config.executionMode === 'flashloan') {
-    return executeViaFlashloan(walletClient, publicClient, plan, config, simulationResult);
+    return executeViaFlashloan(walletClient, publicClient, plan, config, simulationResult, onSent);
   }
-  return executeViaExecutor(walletClient, publicClient, plan, config, simulationResult);
+  return executeViaExecutor(walletClient, publicClient, plan, config, simulationResult, onSent);
 }
 
 /**
