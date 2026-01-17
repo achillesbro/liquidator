@@ -11,5 +11,11 @@
   "flashloanExecutorOwner": "0xdA042130f265e594e3f8aF12E006F63BAD2349d3",
   "flashloanExecutorDeployer": "0xdA042130f265e594e3f8aF12E006F63BAD2349d3",
   "flashloanExecutorDeployedAt": "2026-01-15T15:27:59.587Z",
-  "flashloanExecutorTxHash": "0xeef52edfc4b19eef60e6a8a7b831f250e0bef1c9be29d928efda7813eb1eff35"
+  "flashloanExecutorTxHash": "0xeef52edfc4b19eef60e6a8a7b831f250e0bef1c9be29d928efda7813eb1eff35",
+  "morphoFlashloanExecutorV2": "0x51C6d213a8A9103ad795596EB28070F7ff525B4e",
+  "whype": "0x5555555555555555555555555555555555555555",
+  "flashloanExecutorV2Owner": "0xdA042130f265e594e3f8aF12E006F63BAD2349d3",
+  "flashloanExecutorV2Deployer": "0xdA042130f265e594e3f8aF12E006F63BAD2349d3",
+  "flashloanExecutorV2DeployedAt": "2026-01-17T13:59:09.802Z",
+  "flashloanExecutorV2TxHash": "0xf73d16d7a73fd96e709f70bba0e951acc1876cd08f36d8ef8dd154ba5d7f63f4"
 }

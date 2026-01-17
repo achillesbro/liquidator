@@ -361,9 +361,10 @@ async function confirmLiquidatable(client, morphoBlueAddress, candidate, config 
  * @param {Array} candidates - Array of candidate positions
  * @param {number} maxToConfirm - Maximum positions to confirm
  * @param {Object} config - Configuration object
+ * @param {Function} onLiquidatableFound - Optional callback called immediately when liquidatable positions are found in a batch
  * @returns {Promise<Array>} Array of confirmed liquidatable positions
  */
-async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm = 100, config = {}) {
+async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm = 100, config = {}, onLiquidatableFound = null) {
   const client = createClient(rpcUrl);
   const confirmed = [];
   
@@ -387,6 +388,9 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
     const totalBatches = Math.ceil(toConfirm.length / batchSize);
     
     log(config, `  Batch ${batchNum}/${totalBatches} (${batch.length} positions)...`);
+    
+    // Collect liquidatable positions found in this batch (for streaming callback)
+    const batchLiquidatable = [];
     
     try {
       // Fetch all position data in one multicall
@@ -493,7 +497,7 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
           const seizeValueInLoan = finalSeizeAssets * oraclePrice / ORACLE_PRICE_SCALE;
           const repayAssets = seizeValueInLoan * WAD / liquidationIncentiveFactor;
           
-          confirmed.push({
+          const liquidatablePosition = {
             marketId: candidate.marketId,
             marketParams: { loanToken, collateralToken, oracle, irm, lltv },
             user: candidate.user,
@@ -514,7 +518,10 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
             collateralSymbol: candidate.collateralSymbol,
             loanDecimals: candidate.loanDecimals,
             collateralDecimals: candidate.collateralDecimals,
-          });
+          };
+          
+          confirmed.push(liquidatablePosition);
+          batchLiquidatable.push(liquidatablePosition);
           
           if (!config.testMode && !isJsonlEnabled(config)) {
             console.log(`    ✓ Liquidatable: ${candidate.user} ${candidate.loanSymbol}/${candidate.collateralSymbol}`);
@@ -522,6 +529,11 @@ async function batchConfirm(rpcUrl, morphoBlueAddress, candidates, maxToConfirm 
         } else {
           healthy++;
         }
+      }
+      
+      // Call streaming callback if provided and we found liquidatable positions
+      if (onLiquidatableFound && batchLiquidatable.length > 0) {
+        onLiquidatableFound(batchLiquidatable);
       }
     } catch (error) {
       rpcErrors += batch.length;

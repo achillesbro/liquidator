@@ -92,6 +92,11 @@ function getConfig() {
     whypeAddress: '0x5555555555555555555555555555555555555555',
     multicall3Address: '0xcA11bde05977b3631167028862bE2a173976CA11',
     
+    // Project X (prjx) swap router for profit → HYPE conversion
+    prjxRouterAddress: process.env.PRJX_ROUTER_ADDRESS || '0x1EbDFC75FfE3ba3de61E7138a3E8706aC841Af9B',
+    prjxQuoterAddress: process.env.PRJX_QUOTER_ADDRESS || '0x239F11a7A3E08f2B8110D4CA9F6B95d4c8865258',
+    profitSlippageBps: parseInt(process.env.PROFIT_SLIPPAGE_BPS || '100', 10), // 1% default for profit swap
+    
     // Milestone 4: Execution mode configuration
     executionEnabled: parseInt(process.env.EXECUTION_ENABLED || '0', 10) === 1,
     executionMode, // 'prefund' or 'flashloan'
@@ -102,6 +107,10 @@ function getConfig() {
     
     // Flashloan mode (Milestone 4)
     flashloanExecutorAddress: process.env.FLASHLOAN_EXECUTOR_ADDRESS_999 || '',
+    // V2 executor with HYPE profit conversion
+    flashloanExecutorV2Address: process.env.FLASHLOAN_EXECUTOR_V2_ADDRESS_999 || '',
+    // Use V2 executor (HYPE profits) - set to true after deploying V2
+    useExecutorV2: process.env.USE_EXECUTOR_V2 === '1' || process.env.USE_EXECUTOR_V2 === 'true',
     // Flashloan buffer: must be large enough to cover interest accrual during liquidation
     // Default 100% buffer (double repay amount) to handle deeply underwater positions
     // Morpho's liquidation math can require more than the calculated repay due to:
@@ -142,7 +151,6 @@ function getConfig() {
     telegramMaxPerHour: parseInt(process.env.TELEGRAM_MAX_PER_HOUR || '60', 10),
     
     // Milestone 2 configuration
-    maxCandidates: parseInt(process.env.MAX_CANDIDATES || '100', 10),
     maxSimulations: parseInt(process.env.MAX_SIMULATIONS || '25', 10),
     maxPositionsPrint: parseInt(process.env.MAX_POSITIONS_PRINT || '50', 10),
     simulationOnly: parseInt(process.env.SIMULATION_ONLY || '1', 10) === 1,
@@ -187,7 +195,9 @@ function getConfig() {
     
     // Per-tick caps
     candidatesPerTick: parseInt(process.env.CANDIDATES_PER_TICK || '400', 10),
-    maxConfirmationsPerTick: parseInt(process.env.MAX_CONFIRMATIONS_PER_TICK || '200', 10),
+    maxConfirmationsPerTick: process.env.MAX_CONFIRMATIONS_PER_TICK 
+      ? parseInt(process.env.MAX_CONFIRMATIONS_PER_TICK, 10)
+      : parseInt(process.env.CANDIDATES_PER_TICK || '400', 10), // Default to candidatesPerTick if not set
     maxSimulationsPerTick: parseInt(process.env.MAX_SIMULATIONS_PER_TICK || '75', 10),
     maxTxPerTick: parseInt(process.env.MAX_TX_PER_TICK || '2', 10),
     
@@ -221,6 +231,10 @@ function getConfig() {
  */
 function getActiveExecutorAddress(config) {
   if (config.executionMode === 'flashloan') {
+    // Use V2 executor if enabled and address is set
+    if (config.useExecutorV2 && config.flashloanExecutorV2Address) {
+      return config.flashloanExecutorV2Address;
+    }
     return config.flashloanExecutorAddress;
   }
   return config.executorAddress;

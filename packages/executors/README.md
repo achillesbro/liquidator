@@ -1,8 +1,53 @@
-# IsolatedLiquidator Contracts
+# Liquidator Executor Contracts
 
-Solidity contracts for liquidating HyperLend Isolated Pair positions.
+Solidity contracts for executing liquidations on HyperEVM.
 
-## Contract
+## Morpho Blue Executors
+
+### MorphoFlashloanExecutorV2.sol (Recommended)
+
+Flashloan-based executor with HYPE-denominated profit handling.
+
+**Features:**
+- Uses Morpho flashloans for atomic liquidations
+- Converts loan token profit → WHYPE → HYPE via Project X
+- Sends native HYPE to treasury
+- Enables direct HYPE profit vs HYPE gas cost comparison
+
+**Constructor Parameters:**
+- `initialOwner`: Owner address (bot EOA)
+- `_morpho`: Morpho Blue address
+- `_whype`: Wrapped HYPE address
+
+**Key Functions:**
+- `flashV2(token, assets, calls, treasury, profitSwapParams, skipProfitSwap)`: Execute liquidation with HYPE profit
+
+**Deployed:** `0x51C6d213a8A9103ad795596EB28070F7ff525B4e`
+
+### MorphoFlashloanExecutor606BaXt.sol (V1)
+
+Flashloan-based executor with loan token profits.
+
+**Features:**
+- Uses Morpho flashloans for atomic liquidations
+- Keeps profits in loan token
+- Sends loan token profit to treasury
+
+**Key Functions:**
+- `flash_606BaXt(token, assets, calls, treasury, minProfit)`: Execute liquidation
+
+**Deployed:** `0x98FCe9e656DBc832B2e2392a3fE188f7518CC234`
+
+### Executor606BaXt.sol (Prefund)
+
+Pre-funded executor requiring loan tokens to be deposited upfront.
+
+**Key Functions:**
+- `exec_606BaXt(calls)`: Execute call sequence
+
+---
+
+## HyperLend Isolated Liquidator
 
 ### IsolatedLiquidator.sol
 

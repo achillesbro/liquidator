@@ -338,7 +338,7 @@ function calculateFlashloanAmount(repayAssets, bufferBps = 20, maxAssets = null)
 }
 
 /**
- * Build calls for flashloan callback execution
+ * Build calls for flashloan callback execution (V1 - loan token profits)
  * These calls are executed INSIDE the flashloan callback:
  * 1. Approve Morpho Blue to spend loan token (for liquidation repayment)
  * 2. Execute liquidation (receive collateral)
@@ -444,14 +444,141 @@ function buildCallsForFlashloan(config, liquidation, route) {
 }
 
 /**
+ * Build calls for flashloan callback execution (V2 - HYPE profits)
+ * These calls are executed INSIDE the flashloan callback:
+ * 1. Approve Morpho Blue to spend loan token (for liquidation repayment)
+ * 2. Execute liquidation (receive collateral)
+ * 3. Approve swap router to spend collateral
+ * 4. Execute swap (collateral -> loan token)
+ * 
+ * The V2 contract then handles:
+ * - Approving Morpho to pull flashloan repayment
+ * - Swapping remaining loan token profit -> WHYPE via Project X
+ * - Unwrapping WHYPE -> HYPE
+ * - Sending HYPE profit to treasury
+ * 
+ * @param {Object} config - Configuration
+ * @param {Object} liquidation - Confirmed liquidation details
+ * @param {Object} route - Swap route from LiquidSwap (collateral -> loanToken)
+ * @param {Object} profitRoute - Quote from Project X (loanToken -> WHYPE)
+ * @returns {Object} Flashloan V2 execution plan
+ */
+function buildCallsForFlashloanV2(config, liquidation, route, profitRoute) {
+  const calls = [];
+  
+  const { loanToken, collateralToken } = liquidation.marketParams;
+  
+  // Calculate flashloan amount first (needed for approval)
+  const flashloanAssets = calculateFlashloanAmount(
+    liquidation.repayAssets,
+    config.flashloanBufferBps,
+    config.maxFlashloanAssets
+  );
+  
+  // Step 1: Approve Morpho Blue to spend loan token (for liquidation repayment)
+  const approvalAmount = flashloanAssets;
+  calls.push({
+    ...encodeApproval(loanToken, config.morphoBlueAddress, approvalAmount),
+    description: `Approve Morpho to spend ${approvalAmount} ${liquidation.loanSymbol} for liquidation`,
+  });
+  
+  // Step 2: Execute liquidation on Morpho Blue
+  calls.push({
+    ...encodeLiquidation(
+      config.morphoBlueAddress,
+      liquidation.marketParams,
+      liquidation.user,
+      liquidation.seizeAssets
+    ),
+    description: `Liquidate ${liquidation.user.slice(0, 10)}... seize ${liquidation.seizeAssets} ${liquidation.collateralSymbol}`,
+  });
+  
+  // Step 3: Approve and execute swap (collateral -> loan token)
+  if (route && route.execution) {
+    calls.push({
+      ...encodeApproval(collateralToken, route.execution.to, liquidation.seizeAssets),
+      description: `Approve LiquidSwap to spend ${liquidation.seizeAssets} ${liquidation.collateralSymbol}`,
+    });
+    
+    calls.push({
+      ...encodeSwap(route),
+      description: `Swap ${liquidation.collateralSymbol} -> ${liquidation.loanSymbol} (expected: ${route.expectedOut})`,
+    });
+  }
+  
+  // Estimate profit in loan token
+  const estimatedSwapOut = route ? route.expectedOut : 0n;
+  const estimatedProfitLoanToken = estimatedSwapOut > flashloanAssets 
+    ? estimatedSwapOut - flashloanAssets 
+    : 0n;
+  
+  // Estimate profit in HYPE (from profit route quote)
+  const estimatedHypeProfit = profitRoute && !profitRoute.skipSwap 
+    ? profitRoute.expectedOut 
+    : estimatedProfitLoanToken; // If skipSwap, loanToken is WHYPE so 1:1
+  
+  // Build profit swap params for V2 contract
+  const profitSwapParams = {
+    router: profitRoute?.router || config.prjxRouterAddress,
+    feeTier: profitRoute?.feeTier || 3000, // Default 0.3% if no route
+    minHypeOut: profitRoute?.minOut || 0n,
+  };
+  
+  const skipProfitSwap = profitRoute?.skipSwap || false;
+  
+  // Extra gas for profit swap + unwrap
+  const extraGas = skipProfitSwap ? 50000 : 200000;
+  
+  return {
+    // Execution mode
+    mode: 'flashloanV2',
+    
+    // Flashloan parameters
+    flashloanToken: loanToken,
+    flashloanAssets,
+    
+    // Calls to execute inside callback (liquidation + collateral swap only)
+    calls,
+    
+    // Profit swap params (for V2 contract to handle)
+    profitSwapParams,
+    skipProfitSwap,
+    
+    // Liquidation details
+    liquidation,
+    route,
+    profitRoute,
+    
+    // Profit info
+    repayRequired: liquidation.repayAssets,
+    estimatedSwapOut,
+    estimatedProfitLoanToken,
+    estimatedHypeProfit,
+    minProfit: 0n, // V2 uses minHypeOut in profitSwapParams
+    
+    // Token addresses for convenience
+    loanToken,
+    collateralToken,
+    
+    // Gas estimate (higher for V2 due to extra swap + unwrap)
+    estimatedGas: calculateEstimatedGas(calls, route) + 100000 + extraGas,
+  };
+}
+
+/**
  * Build execution plan based on mode
  * @param {Object} config - Configuration
  * @param {Object} liquidation - Confirmed liquidation details
  * @param {Object} route - Swap route from LiquidSwap
+ * @param {Object} profitRoute - Optional profit route for V2 (loanToken -> WHYPE)
  * @returns {Object} Execution plan
  */
-function buildExecutionPlan(config, liquidation, route) {
+function buildExecutionPlan(config, liquidation, route, profitRoute = null) {
   if (config.executionMode === 'flashloan') {
+    // Use V2 executor if enabled and profit route is provided
+    if (config.useExecutorV2 && profitRoute) {
+      return buildCallsForFlashloanV2(config, liquidation, route, profitRoute);
+    }
     return buildCallsForFlashloan(config, liquidation, route);
   }
   // Default to prefund mode
@@ -466,6 +593,7 @@ module.exports = {
   buildLiquidationPlan,
   buildCallsForExecutor,
   buildCallsForFlashloan,
+  buildCallsForFlashloanV2,
   buildExecutionPlan,
   calculateEstimatedGas,
   calculateFlashloanAmount,

@@ -95,6 +95,7 @@ async function fetchMarketsForVaults(apiUrl, chainId, vaultAddresses) {
 /**
  * Fetch candidate positions from Morpho API
  * Positions with active borrows that might be liquidatable
+ * Supports pagination to fetch more than 500 candidates
  * @param {string} apiUrl - Morpho API URL
  * @param {number} chainId - Chain ID
  * @param {Array<string>} marketIds - Market unique keys
@@ -103,18 +104,20 @@ async function fetchMarketsForVaults(apiUrl, chainId, vaultAddresses) {
  */
 async function fetchCandidatePositions(apiUrl, chainId, marketIds, maxCandidates = 200) {
   const url = `${apiUrl}/graphql`;
+  const API_LIMIT = 500; // Morpho API pagination limit per request
   
   // Query for market positions with borrows
   // We fetch positions ordered by borrow amount
   const query = `
-    query GetPositions($chainId: Int!, $marketIds: [String!]!, $first: Int!) {
+    query GetPositions($chainId: Int!, $marketIds: [String!]!, $first: Int!, $skip: Int) {
       marketPositions(
         where: {
           chainId_in: [$chainId],
           marketUniqueKey_in: $marketIds,
           borrowShares_gte: "1"
         },
-        first: $first
+        first: $first,
+        skip: $skip
       ) {
         items {
           user {
@@ -146,56 +149,92 @@ async function fetchCandidatePositions(apiUrl, chainId, marketIds, maxCandidates
     }
   `;
   
-  return retry(async () => {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        query,
-        variables: {
-          chainId,
-          marketIds,
-          first: Math.min(maxCandidates, 500), // API limit
+  // Fetch a single page of results
+  async function fetchPage(skip = 0) {
+    return retry(async () => {
+      const pageSize = Math.min(API_LIMIT, maxCandidates - skip);
+      if (pageSize <= 0) return [];
+      
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
-      }),
+        body: JSON.stringify({
+          query,
+          variables: {
+            chainId,
+            marketIds,
+            first: pageSize,
+            skip,
+          },
+        }),
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Morpho API error: ${response.status} ${response.statusText}`);
+      }
+      
+      const data = await response.json();
+      
+      if (!data || !data.data || !data.data.marketPositions) {
+        throw new Error('Invalid response from Morpho API');
+      }
+      
+      const positions = data.data.marketPositions.items || [];
+      
+      // Normalize to candidate format
+      return positions.map(pos => ({
+        marketId: pos.market.uniqueKey,
+        user: pos.user.address,
+        loanToken: pos.market.loanAsset?.address,
+        collateralToken: pos.market.collateralAsset?.address,
+        loanSymbol: pos.market.loanAsset?.symbol,
+        collateralSymbol: pos.market.collateralAsset?.symbol,
+        loanDecimals: pos.market.loanAsset?.decimals || 18,
+        collateralDecimals: pos.market.collateralAsset?.decimals || 18,
+        lltv: pos.market.lltv,
+        oracle: pos.market.oracle?.address,
+        irm: pos.market.irmAddress,
+        supplyShares: pos.supplyShares,
+        borrowShares: pos.borrowShares,
+        collateral: pos.collateral,
+      }));
+    }, {
+      maxRetries: 3,
+      delayMs: 1000,
+      description: 'fetch candidate positions',
     });
+  }
+  
+  // Fetch all pages if needed
+  const allCandidates = [];
+  let skip = 0;
+  
+  while (allCandidates.length < maxCandidates) {
+    const page = await fetchPage(skip);
     
-    if (!response.ok) {
-      throw new Error(`Morpho API error: ${response.status} ${response.statusText}`);
+    if (page.length === 0) {
+      // No more results available
+      break;
     }
     
-    const data = await response.json();
+    allCandidates.push(...page);
+    skip += page.length;
     
-    if (!data || !data.data || !data.data.marketPositions) {
-      throw new Error('Invalid response from Morpho API');
+    // If we got fewer results than requested, we've reached the end
+    if (page.length < API_LIMIT) {
+      break;
     }
     
-    const positions = data.data.marketPositions.items || [];
-    
-    // Normalize to candidate format
-    return positions.map(pos => ({
-      marketId: pos.market.uniqueKey,
-      user: pos.user.address,
-      loanToken: pos.market.loanAsset?.address,
-      collateralToken: pos.market.collateralAsset?.address,
-      loanSymbol: pos.market.loanAsset?.symbol,
-      collateralSymbol: pos.market.collateralAsset?.symbol,
-      loanDecimals: pos.market.loanAsset?.decimals || 18,
-      collateralDecimals: pos.market.collateralAsset?.decimals || 18,
-      lltv: pos.market.lltv,
-      oracle: pos.market.oracle?.address,
-      irm: pos.market.irmAddress,
-      supplyShares: pos.supplyShares,
-      borrowShares: pos.borrowShares,
-      collateral: pos.collateral,
-    }));
-  }, {
-    maxRetries: 3,
-    delayMs: 1000,
-    description: 'fetch candidate positions',
-  });
+    // If we've fetched enough, stop
+    if (allCandidates.length >= maxCandidates) {
+      break;
+    }
+  }
+  
+  // Return exactly maxCandidates (or fewer if not enough available)
+  return allCandidates.slice(0, maxCandidates);
 }
 
 module.exports = {

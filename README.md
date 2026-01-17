@@ -12,13 +12,15 @@ pnpm install
 
 ### Morpho Bot
 
-Liquidation bot for Morpho Blue with two execution modes:
-- **Flashloan Mode** (recommended): Uses Morpho flashloans for atomic execution
+Liquidation bot for Morpho Blue with three execution modes:
+- **Flashloan V2 Mode** (recommended): HYPE-denominated profits, gas-aware profitability
+- **Flashloan V1 Mode**: Loan token profits
 - **Prefund Mode**: Uses pre-funded executor with loan tokens
 
 ```bash
-# 1. Deploy executor
-pnpm --filter @packages/executors hardhat:deploy:morpho-flashloan
+# 1. Deploy V2 executor (recommended)
+cd packages/executors
+pnpm hardhat run scripts/deploy_morpho_flashloan_executor_v2.js --network hyperEvm
 
 # 2. Configure environment
 cd apps/morpho-bot && cp .env.example .env
@@ -79,8 +81,9 @@ See [`apps/ponder/README.md`](apps/ponder/README.md) for details.
 
 - **Discovery**: Fetches liquidatable positions from Morpho API
 - **Confirmation**: Validates positions onchain using Morpho SDK
-- **Routing**: Gets swap routes from LiquidSwap API
-- **Execution**: Executes liquidations via executor contracts (flashloan or prefund mode)
+- **Routing**: Gets swap routes from LiquidSwap API (collateral → loan token)
+- **Profit Quoting** (V2): Gets profit routes from Project X (loan token → HYPE)
+- **Execution**: Executes liquidations via executor contracts (flashloan V1/V2 or prefund mode)
 
 ### HyperLend Bot
 
