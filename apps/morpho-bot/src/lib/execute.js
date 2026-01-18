@@ -11,6 +11,7 @@ const {
   encodeFunctionData,
   formatEther,
   formatUnits,
+  toFunctionSelector,
 } = require('viem');
 
 // viem/accounts exports
@@ -25,6 +26,228 @@ try {
 const { checkExecutorBalance, ERC20_ABI } = require('./encodePlan');
 const { getActiveExecutorAddress } = require('./env');
 const { isJsonlEnabled, emitEvent, log } = require('./logger');
+
+// ============================================
+// V2 Error Registry - computed selectors
+// ============================================
+
+/**
+ * Error specification for decoding contract errors
+ * @typedef {Object} ErrorSpec
+ * @property {string} signature - Solidity error signature (e.g., "InsufficientHypeProfit(uint256,uint256)")
+ * @property {string} errorType - Internal error type identifier
+ * @property {string[]} params - Parameter names for decoding
+ * @property {Function} format - Function to format decoded params into human-readable string
+ */
+
+/** @type {ErrorSpec[]} */
+const V2_ERROR_SPECS = [
+  {
+    signature: 'InsufficientHypeProfit(uint256,uint256)',
+    errorType: 'insufficient_hype_profit',
+    params: ['actual', 'minimum'],
+    format: (decoded) => `InsufficientHypeProfit: actual=${decoded.actual} wei, minimum=${decoded.minimum} wei`,
+  },
+  {
+    signature: 'InsufficientBalance(uint256,uint256)',
+    errorType: 'insufficient_balance',
+    params: ['actual', 'required'],
+    format: (decoded) => `InsufficientBalance: actual=${decoded.actual}, required=${decoded.required}`,
+  },
+  {
+    signature: 'CallFailed(uint256,bytes)',
+    errorType: 'call_failed',
+    params: ['index', 'reason'],
+    format: (decoded, extra) => {
+      const callNames = ['Approve Morpho', 'Liquidate', 'Approve Router', 'Swap'];
+      const callName = callNames[decoded.index] || 'Unknown';
+      return `CallFailed at step ${decoded.index} [${callName}]${extra || ''}`;
+    },
+  },
+  {
+    signature: 'OnlyMorpho()',
+    errorType: 'only_morpho',
+    params: [],
+    format: () => 'OnlyMorpho: caller is not Morpho',
+  },
+  {
+    signature: 'UnexpectedFlashloan()',
+    errorType: 'unexpected_flashloan',
+    params: [],
+    format: () => 'UnexpectedFlashloan: flashloan parameters mismatch',
+  },
+  {
+    signature: 'HypeTransferFailed()',
+    errorType: 'hype_transfer_failed',
+    params: [],
+    format: () => 'HypeTransferFailed: HYPE transfer to treasury failed',
+  },
+  {
+    // Standard Error(string) revert
+    signature: 'Error(string)',
+    errorType: 'revert_string',
+    params: ['message'],
+    format: (decoded) => `Revert: "${decoded.message}"`,
+  },
+  {
+    // Standard Panic(uint256) - Solidity internal errors
+    signature: 'Panic(uint256)',
+    errorType: 'panic',
+    params: ['code'],
+    format: (decoded) => {
+      const panicCodes = {
+        0x00: 'generic compiler panic',
+        0x01: 'assertion failed',
+        0x11: 'arithmetic overflow/underflow',
+        0x12: 'division by zero',
+        0x21: 'invalid enum value',
+        0x22: 'storage byte array encoding error',
+        0x31: 'pop on empty array',
+        0x32: 'array index out of bounds',
+        0x41: 'too much memory allocated',
+        0x51: 'zero-initialized function pointer',
+      };
+      const code = Number(decoded.code);
+      const reason = panicCodes[code] || `unknown panic code 0x${code.toString(16)}`;
+      return `Panic(${code}): ${reason}`;
+    },
+  },
+  {
+    // V1 InsufficientProfit
+    signature: 'InsufficientProfit(uint256,uint256)',
+    errorType: 'insufficient_profit',
+    params: ['actual', 'required'],
+    format: (decoded) => `InsufficientProfit: actual=${decoded.actual}, required=${decoded.required}`,
+  },
+];
+
+// Compute selectors at module load time
+const V2_ERROR_REGISTRY = new Map();
+for (const spec of V2_ERROR_SPECS) {
+  const selector = toFunctionSelector(spec.signature).toLowerCase().slice(2); // Remove '0x', lowercase
+  V2_ERROR_REGISTRY.set(selector, spec);
+}
+
+/**
+ * Decode V2 executor error from raw hex data
+ * @param {string} rawData - Raw hex string (with or without 0x prefix)
+ * @returns {Object|null} Decoded error or null if unknown
+ */
+function decodeV2Error(rawData) {
+  if (!rawData || typeof rawData !== 'string' || rawData.length < 10) {
+    return null;
+  }
+
+  // Normalize: remove 0x prefix, lowercase
+  const data = rawData.toLowerCase().replace(/^0x/, '');
+  
+  // Extract 4-byte selector (8 hex chars)
+  const selector = data.slice(0, 8);
+  const spec = V2_ERROR_REGISTRY.get(selector);
+  
+  if (!spec) {
+    return null; // Unknown error
+  }
+
+  const decoded = {};
+  const paramData = data.slice(8); // Everything after selector
+  
+  try {
+    // Handle special cases
+    if (spec.errorType === 'call_failed') {
+      // CallFailed(uint256 index, bytes reason)
+      if (paramData.length >= 64) {
+        decoded.index = parseInt(paramData.slice(0, 64), 16);
+        
+        // Decode nested reason if present
+        let nestedReason = '';
+        if (paramData.length > 128) {
+          const offset = parseInt(paramData.slice(64, 128), 16) * 2;
+          if (paramData.length > offset + 64) {
+            const length = parseInt(paramData.slice(offset, offset + 64), 16) * 2;
+            const reasonHex = paramData.slice(offset + 64, offset + 64 + Math.min(length, 500));
+            
+            if (reasonHex.length > 0) {
+              // Check if it's a nested Error(string)
+              if (reasonHex.startsWith('08c379a0') && reasonHex.length >= 136) {
+                const strLength = parseInt(reasonHex.slice(72, 136), 16) * 2;
+                const strHex = reasonHex.slice(136, 136 + Math.min(strLength, 200));
+                const decodedStr = Buffer.from(strHex, 'hex').toString('utf8').replace(/\0/g, '');
+                nestedReason = `: "${decodedStr}"`;
+              } else {
+                nestedReason = `: 0x${reasonHex.slice(0, 64)}${reasonHex.length > 64 ? '...' : ''}`;
+              }
+            }
+          }
+        }
+        
+        return {
+          errorType: spec.errorType,
+          selector,
+          decoded,
+          message: spec.format(decoded, nestedReason),
+        };
+      }
+    } else if (spec.errorType === 'revert_string') {
+      // Error(string) - ABI-encoded string
+      if (paramData.length >= 128) {
+        const strLength = parseInt(paramData.slice(64, 128), 16) * 2;
+        const strHex = paramData.slice(128, 128 + Math.min(strLength, 400));
+        decoded.message = Buffer.from(strHex, 'hex').toString('utf8').replace(/\0/g, '');
+        
+        return {
+          errorType: spec.errorType,
+          selector,
+          decoded,
+          message: spec.format(decoded),
+        };
+      }
+    } else if (spec.params.length === 0) {
+      // No params (e.g., OnlyMorpho())
+      return {
+        errorType: spec.errorType,
+        selector,
+        decoded: {},
+        message: spec.format({}),
+      };
+    } else if (spec.params.length === 1 && spec.params[0] === 'code') {
+      // Panic(uint256)
+      if (paramData.length >= 64) {
+        decoded.code = BigInt('0x' + paramData.slice(0, 64));
+        return {
+          errorType: spec.errorType,
+          selector,
+          decoded,
+          message: spec.format(decoded),
+        };
+      }
+    } else if (spec.params.length === 2) {
+      // Two uint256 params (most common case)
+      if (paramData.length >= 128) {
+        decoded[spec.params[0]] = BigInt('0x' + paramData.slice(0, 64));
+        decoded[spec.params[1]] = BigInt('0x' + paramData.slice(64, 128));
+        
+        return {
+          errorType: spec.errorType,
+          selector,
+          decoded,
+          message: spec.format(decoded),
+        };
+      }
+    }
+  } catch (e) {
+    // Decoding failed, return partial result
+    return {
+      errorType: spec.errorType,
+      selector,
+      decoded: {},
+      message: `${spec.signature} (decode failed: ${e.message})`,
+      decodeError: e.message,
+    };
+  }
+
+  return null;
+}
 
 /**
  * Truncate string to max length
@@ -1024,128 +1247,44 @@ async function simulateFlashloanV2Call(publicClient, plan, config) {
     let rawData = error.rawRevertData;
     let revertReason = error.originalError?.shortMessage || error.shortMessage || error.message;
     
-    // Debug output
-    console.log(`    [DEBUG] V2 rawRevertData: ${rawData?.slice(0, 200)}`);
-    
     if (!rawData) {
       // Fallback: try to find raw data from viem error structure
       rawData = error.cause?.data || error.data || error.cause?.cause?.data;
-      console.log(`    [DEBUG] V2 fallback rawData: ${rawData?.slice(0, 200)}`);
     }
     
-    // Try to decode known V2 errors from raw data
+    // Try to decode using the error registry
     if (rawData && typeof rawData === 'string' && rawData.length > 10) {
-      const rawLower = rawData.toLowerCase();
+      const decodedError = decodeV2Error(rawData);
       
-      // InsufficientHypeProfit(uint256 actual, uint256 minimum) - need to calculate selector
-      // keccak256("InsufficientHypeProfit(uint256,uint256)") first 4 bytes
-      const insufficientHypeProfitSelector = 'e74af89e'; // Computed
-      if (rawLower.includes(insufficientHypeProfitSelector)) {
-        try {
-          const selectorPos = rawLower.indexOf(insufficientHypeProfitSelector);
-          const dataStart = selectorPos + 8;
-          const data = rawData.slice(dataStart);
-          
-          if (data.length >= 128) {
-            const actualHex = data.slice(0, 64);
-            const minimumHex = data.slice(64, 128);
-            const actual = BigInt('0x' + actualHex);
-            const minimum = BigInt('0x' + minimumHex);
-            
-            revertReason = `InsufficientHypeProfit: actual=${actual} wei, minimum=${minimum} wei`;
-            
-            return {
-              success: false,
-              error: revertReason,
-              errorType: 'insufficient_hype_profit',
-              gasEstimate: 0,
-              hypeActual: actual,
-              hypeMinimum: minimum,
-            };
-          }
-        } catch (decodeError) {
-          console.log(`    [DEBUG] InsufficientHypeProfit decode error: ${decodeError.message}`);
+      if (decodedError) {
+        const result = {
+          success: false,
+          error: decodedError.message,
+          errorType: decodedError.errorType,
+          gasEstimate: 0,
+          rawSelector: decodedError.selector,
+        };
+        
+        // Add type-specific fields for downstream processing
+        if (decodedError.errorType === 'insufficient_hype_profit') {
+          result.hypeActual = decodedError.decoded.actual;
+          result.hypeMinimum = decodedError.decoded.minimum;
+        } else if (decodedError.errorType === 'insufficient_balance') {
+          result.balanceActual = decodedError.decoded.actual;
+          result.balanceRequired = decodedError.decoded.required;
+        } else if (decodedError.errorType === 'insufficient_profit') {
+          result.profitActual = decodedError.decoded.actual;
+          result.profitRequired = decodedError.decoded.required;
+        } else if (decodedError.errorType === 'call_failed') {
+          result.callIndex = decodedError.decoded.index;
         }
+        
+        return result;
       }
       
-      // InsufficientBalance(uint256 actual, uint256 required) 
-      const insufficientBalanceSelector = 'cf479181'; // keccak256("InsufficientBalance(uint256,uint256)")
-      if (rawLower.includes(insufficientBalanceSelector)) {
-        try {
-          const selectorPos = rawLower.indexOf(insufficientBalanceSelector);
-          const dataStart = selectorPos + 8;
-          const data = rawData.slice(dataStart);
-          
-          if (data.length >= 128) {
-            const actualHex = data.slice(0, 64);
-            const requiredHex = data.slice(64, 128);
-            const actual = BigInt('0x' + actualHex);
-            const required = BigInt('0x' + requiredHex);
-            
-            revertReason = `InsufficientBalance: actual=${actual}, required=${required}`;
-            
-            return {
-              success: false,
-              error: revertReason,
-              errorType: 'insufficient_balance',
-              gasEstimate: 0,
-              balanceActual: actual,
-              balanceRequired: required,
-            };
-          }
-        } catch (decodeError) {
-          console.log(`    [DEBUG] InsufficientBalance decode error: ${decodeError.message}`);
-        }
-      }
-      
-      // Reuse CallFailed decoder from V1
-      const callFailedSelector = '5c0dee5d';
-      if (rawLower.includes(callFailedSelector)) {
-        try {
-          const selectorPos = rawLower.indexOf(callFailedSelector);
-          const dataStart = selectorPos + 8;
-          const data = rawData.slice(dataStart);
-          
-          if (data.length >= 64) {
-            const indexHex = data.slice(0, 64);
-            const callIndex = parseInt(indexHex, 16);
-            
-            const callNames = ['Approve Morpho', 'Liquidate', 'Approve Router', 'Swap'];
-            const callName = callNames[callIndex] || `Unknown`;
-            
-            let nestedReason = '';
-            if (data.length > 128) {
-              try {
-                const offsetHex = data.slice(64, 128);
-                const offset = parseInt(offsetHex, 16) * 2;
-                
-                if (data.length > offset + 64) {
-                  const lengthHex = data.slice(offset, offset + 64);
-                  const length = parseInt(lengthHex, 16) * 2;
-                  
-                  const reasonHex = data.slice(offset + 64, offset + 64 + Math.min(length, 500));
-                  if (reasonHex.length > 0) {
-                    if (reasonHex.toLowerCase().startsWith('08c379a0') && reasonHex.length >= 136) {
-                      const strLength = parseInt(reasonHex.slice(72, 136), 16) * 2;
-                      const strHex = reasonHex.slice(136, 136 + Math.min(strLength, 200));
-                      const decoded = Buffer.from(strHex, 'hex').toString('utf8').replace(/\0/g, '');
-                      nestedReason = `: "${decoded}"`;
-                    } else {
-                      nestedReason = `: 0x${reasonHex.slice(0, 64)}${reasonHex.length > 64 ? '...' : ''}`;
-                    }
-                  }
-                }
-              } catch (e) {
-                console.log(`    [DEBUG] V2 Nested decode error: ${e.message}`);
-              }
-            }
-            
-            revertReason = `CallFailed at step ${callIndex} [${callName}]${nestedReason}`;
-          }
-        } catch (decodeError) {
-          console.log(`    [DEBUG] V2 CallFailed decode error: ${decodeError.message}`);
-        }
-      }
+      // Unknown selector - log for debugging
+      const selector = rawData.toLowerCase().replace(/^0x/, '').slice(0, 8);
+      console.log(`    [DEBUG] V2 unknown error selector: 0x${selector}`);
     }
     
     return {
@@ -1391,6 +1530,8 @@ module.exports = {
   dispatchExecution,
   calculateActualProfit,
   formatExecutionResult,
+  decodeV2Error,
+  V2_ERROR_REGISTRY,
   EXECUTOR_ABI,
   FLASHLOAN_EXECUTOR_ABI,
   FLASHLOAN_EXECUTOR_V2_ABI,

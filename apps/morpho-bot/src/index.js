@@ -42,6 +42,7 @@ const {
 } = require('./lib/operations');
 const { createTelegramClient } = require('./lib/telegram');
 const { formatSuccess, formatSent, formatFail } = require('./lib/telegramFormat');
+const { createErrorDigest } = require('./lib/errorDigest');
 const cache = require('./lib/cache');
 const { CandidateBacklog } = require('./lib/backlog');
 const { Scheduler } = require('./lib/scheduler');
@@ -274,6 +275,27 @@ async function processAndExecuteLiquidation(liquidation, ctx, streamingState, ex
     );
 
     if (!simResult.success) {
+      // Record error for daily digest
+      if (ctx.errorDigest) {
+        ctx.errorDigest.recordError({
+          errorType: simResult.errorType || 'sim_failed',
+          message: simResult.error,
+          marketId: liquidation.marketId,
+          user: liquidation.user,
+          pair,
+          route: route?.venue,
+          amount: liquidation.repayAssets,
+          selector: simResult.rawSelector,
+          extra: {
+            hypeActual: simResult.hypeActual?.toString(),
+            hypeMinimum: simResult.hypeMinimum?.toString(),
+            profitActual: simResult.profitActual?.toString(),
+            profitRequired: simResult.profitRequired?.toString(),
+            callIndex: simResult.callIndex,
+          },
+        });
+      }
+      
       // Check if this is an InsufficientProfit error (contract-level profit check)
       if (simResult.errorType === 'insufficient_profit') {
         log(config, `  [STREAM-UNPROFITABLE] ${userShort} ${pair}: ${simResult.error}`);
@@ -438,6 +460,20 @@ async function processAndExecuteLiquidation(liquidation, ctx, streamingState, ex
       addToCooldown(liquidation.marketId, liquidation.user, `Exec failed: ${result.error}`, 'execFail');
       log(config, `  [STREAM-EXEC_FAIL] ${userShort} ${pair}: ${result.error}`);
 
+      // Record execution error for daily digest
+      if (ctx.errorDigest) {
+        ctx.errorDigest.recordError({
+          errorType: 'exec_failed',
+          message: result.error || 'Unknown error',
+          marketId: liquidation.marketId,
+          user: liquidation.user,
+          pair,
+          route: route?.venue,
+          amount: liquidation.repayAssets,
+          extra: { txHash: result.hash },
+        });
+      }
+
       // Telegram failure notification
       if (telegramClient) {
         const dedupeKey = result.hash || `${liquidation.marketId}:${liquidation.user}:${Math.floor(Date.now() / 60000)}`;
@@ -462,6 +498,18 @@ async function processAndExecuteLiquidation(liquidation, ctx, streamingState, ex
     streamingState.errors++;
     logError(config, `[STREAM-ERROR] ${userShort} ${pair}: ${error.message}`, error);
     addToCooldown(liquidation.marketId, liquidation.user, `Error: ${error.message}`, 'fail');
+    
+    // Record general error for daily digest
+    if (ctx.errorDigest) {
+      ctx.errorDigest.recordError({
+        errorType: 'unknown',
+        message: error.message,
+        marketId: liquidation.marketId,
+        user: liquidation.user,
+        pair,
+      });
+    }
+    
     return { status: 'error', error: error.message };
   }
 }
@@ -1390,6 +1438,21 @@ async function main() {
     // Initialize Telegram client
     const telegramClient = initializeTelegramClient(config);
 
+    // Initialize error digest (daily summary at 8am UTC)
+    const errorDigest = telegramClient ? createErrorDigest({
+      telegramClient,
+      targetHourUtc: config.errorDigestHourUtc ?? 8,
+      maxErrorsPerType: 10,
+      maxTotalErrors: 500,
+      enabled: config.errorDigestEnabled !== false, // Enabled by default if telegram is configured
+    }) : null;
+
+    // Start error digest scheduler
+    if (errorDigest) {
+      errorDigest.startScheduler();
+      log(config, `✓ Error digest enabled (sends at ${config.errorDigestHourUtc ?? 8}:00 UTC)`);
+    }
+
     // Initialize backlog
     const backlog = new CandidateBacklog(config);
 
@@ -1399,6 +1462,7 @@ async function main() {
       executionClients,
       backlog,
       telegramClient,
+      errorDigest,
     };
 
     // Send startup notification
@@ -1420,6 +1484,14 @@ async function main() {
       const scheduler = new Scheduler(config);
       
       const onShutdown = async () => {
+        // Send final error digest before shutdown if there are errors
+        if (errorDigest && errorDigest.totalErrorCount > 0) {
+          log(config, '[Shutdown] Sending final error digest...');
+          await errorDigest.sendDigestAndReset();
+        }
+        if (errorDigest) {
+          errorDigest.cleanup();
+        }
         if (telegramClient) {
           await telegramClient.send('bot_stop', '🛑 BOT STOP', { force: true });
           telegramClient.cleanup();

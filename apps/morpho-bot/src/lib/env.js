@@ -214,6 +214,10 @@ function getConfig() {
     
     // Logging format
     logFormat: (process.env.LOG_FORMAT || 'pretty').toLowerCase(), // 'pretty' or 'jsonl'
+    
+    // Error digest (daily summary via Telegram)
+    errorDigestEnabled: process.env.ERROR_DIGEST_ENABLED !== '0', // Enabled by default
+    errorDigestHourUtc: parseInt(process.env.ERROR_DIGEST_HOUR_UTC || '8', 10), // Default 8am UTC
   };
   
   // Validate if execution is enabled
