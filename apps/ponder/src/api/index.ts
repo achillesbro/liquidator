@@ -1,133 +1,212 @@
-import { ponder } from "ponder:registry";
-import { eq, inArray, gt } from "ponder";
+import { and, eq, gt, graphql, inArray, sql } from "ponder";
+import { db } from "ponder:api";
+import schema from "ponder:schema";
+import { Hono } from "hono";
+import type { Hex } from "viem";
 
-// HTTP API endpoints for Morpho bot
-// These endpoints must maintain the same shape as Milestone 1 expects
+const app = new Hono();
 
-// Note: /health and /status are automatically provided by Ponder 0.8
-// We'll create a custom endpoint for backward compatibility with morpho-bot
-ponder.get("/api/health", (c) => {
-  return c.json({ status: "ok", timestamp: Date.now() });
+// Serve GraphQL on root and /graphql
+app.use("/", graphql({ db, schema }));
+app.use("/graphql", graphql({ db, schema }));
+
+// Health check
+app.get("/api/health", (c) => {
+  return c.json({
+    status: "ok",
+    timestamp: Date.now(),
+    service: "morpho-ponder-indexer",
+  });
 });
 
-// POST /chain/:chainId/withdraw-queue-set
-// Returns array of market IDs from vaults' withdraw queues
-ponder.post("/chain/:chainId/withdraw-queue-set", async (c) => {
-  const chainId = parseInt(c.req.param("chainId"), 10);
-  const body = await c.req.json();
-  const { vaults } = body as { vaults: string[] };
+// List all markets
+app.get("/api/markets", async (c) => {
+  const markets = await db.select().from(schema.market);
 
-  if (!Array.isArray(vaults)) {
-    return c.json({ error: "vaults must be an array" }, 400);
-  }
-
-  const { db } = c.var;
-
-  // Query vaults from database
-  const vaultRecords = await db
-    .select()
-    .from(db.sql.vault)
-    .where(
-      and(
-        eq(db.sql.vault.chainId, chainId),
-        inArray(db.sql.vault.address, vaults)
-      )
-    );
-
-  // Collect unique market IDs from withdraw queues
-  const marketIds = new Set<string>();
-  for (const vault of vaultRecords) {
-    if (vault.withdrawQueue && Array.isArray(vault.withdrawQueue)) {
-      for (const marketId of vault.withdrawQueue) {
-        marketIds.add(marketId);
-      }
-    }
-  }
-
-  return c.json(Array.from(marketIds));
+  return c.json({
+    count: markets.length,
+    markets: markets.map((m) => ({
+      id: m.id,
+      chainId: m.chainId,
+      loanToken: m.loanToken,
+      collateralToken: m.collateralToken,
+      oracle: m.oracle,
+      irm: m.irm,
+      lltv: m.lltv.toString(),
+      totalSupplyAssets: m.totalSupplyAssets.toString(),
+      totalSupplyShares: m.totalSupplyShares.toString(),
+      totalBorrowAssets: m.totalBorrowAssets.toString(),
+      totalBorrowShares: m.totalBorrowShares.toString(),
+      lastUpdate: m.lastUpdate.toString(),
+      fee: m.fee.toString(),
+    })),
+  });
 });
 
-// POST /chain/:chainId/liquidatable-positions
-// Returns liquidatable positions for given markets
-ponder.post("/chain/:chainId/liquidatable-positions", async (c) => {
-  const chainId = parseInt(c.req.param("chainId"), 10);
-  const body = await c.req.json();
-  const { marketIds } = body as { marketIds: string[] };
+// Get market by ID
+app.get("/api/markets/:marketId", async (c) => {
+  const marketId = c.req.param("marketId") as Hex;
 
-  if (!Array.isArray(marketIds)) {
-    return c.json({ error: "marketIds must be an array" }, 400);
+  const result = await db.query.market.findFirst({
+    where: (row) => and(eq(row.id, marketId)),
+  });
+
+  if (!result) {
+    return c.json({ error: "Market not found" }, 404);
   }
 
-  const { db } = c.var;
+  const m = result;
+  return c.json({
+    id: m.id,
+    chainId: m.chainId,
+    loanToken: m.loanToken,
+    collateralToken: m.collateralToken,
+    oracle: m.oracle,
+    irm: m.irm,
+    lltv: m.lltv.toString(),
+    totalSupplyAssets: m.totalSupplyAssets.toString(),
+    totalSupplyShares: m.totalSupplyShares.toString(),
+    totalBorrowAssets: m.totalBorrowAssets.toString(),
+    totalBorrowShares: m.totalBorrowShares.toString(),
+    lastUpdate: m.lastUpdate.toString(),
+    fee: m.fee.toString(),
+  });
+});
 
-  // Query positions with debt in these markets
+// Get positions with debt (potential liquidation candidates)
+app.get("/api/positions", async (c) => {
+  const marketIdParam = c.req.query("marketId") as Hex | undefined;
+  const limitParam = parseInt(c.req.query("limit") || "1000", 10);
+  const limit = Math.min(limitParam, 5000);
+
+  const conditions = marketIdParam
+    ? and(gt(schema.position.borrowShares, 0n), eq(schema.position.marketId, marketIdParam))
+    : gt(schema.position.borrowShares, 0n);
+
   const positions = await db
     .select()
-    .from(db.sql.position)
+    .from(schema.position)
+    .where(conditions)
+    .limit(limit);
+
+  return c.json({
+    count: positions.length,
+    positions: positions.map((p) => ({
+      chainId: p.chainId,
+      marketId: p.marketId,
+      user: p.user,
+      supplyShares: p.supplyShares.toString(),
+      borrowShares: p.borrowShares.toString(),
+      collateral: p.collateral.toString(),
+    })),
+  });
+});
+
+// Get positions for a specific user
+app.get("/api/positions/:user", async (c) => {
+  const userAddress = c.req.param("user") as Hex;
+
+  const positions = await db
+    .select()
+    .from(schema.position)
+    .where(eq(schema.position.user, userAddress));
+
+  return c.json({
+    user: userAddress,
+    count: positions.length,
+    positions: positions.map((p) => ({
+      chainId: p.chainId,
+      marketId: p.marketId,
+      supplyShares: p.supplyShares.toString(),
+      borrowShares: p.borrowShares.toString(),
+      collateral: p.collateral.toString(),
+    })),
+  });
+});
+
+// POST /api/candidates - Liquidation candidates for given market IDs
+app.post("/api/candidates", async (c) => {
+  const body = await c.req.json();
+  const { marketIds, limit: limitParam } = body as {
+    marketIds: string[];
+    limit?: number;
+  };
+
+  if (!Array.isArray(marketIds) || marketIds.length === 0) {
+    return c.json({ error: "marketIds must be a non-empty array" }, 400);
+  }
+
+  const limit = Math.min(limitParam || 1000, 5000);
+
+  const positions = await db
+    .select()
+    .from(schema.position)
     .where(
       and(
-        eq(db.sql.position.chainId, chainId),
-        inArray(db.sql.position.marketId, marketIds),
-        gt(db.sql.position.borrowShares, 0n)
-      )
-    );
+        inArray(schema.position.marketId, marketIds as Hex[]),
+        gt(schema.position.borrowShares, 0n),
+      ),
+    )
+    .limit(limit);
 
-  // Query markets to get token addresses
   const markets = await db
     .select()
-    .from(db.sql.market)
-    .where(
-      and(
-        eq(db.sql.market.chainId, chainId),
-        inArray(db.sql.market.id, marketIds)
-      )
-    );
+    .from(schema.market)
+    .where(inArray(schema.market.id, marketIds as Hex[]));
 
   const marketMap = new Map(markets.map((m) => [m.id, m]));
 
-  // Format results to match Milestone 1 expectations
-  const results = positions.map((pos) => {
-    const market = marketMap.get(pos.marketId);
+  const candidates = positions.map((p) => {
+    const m = marketMap.get(p.marketId);
+
+    let borrowAssets = 0n;
+    if (m && m.totalBorrowShares > 0n) {
+      borrowAssets = (p.borrowShares * m.totalBorrowAssets) / m.totalBorrowShares;
+    }
 
     return {
-      marketId: pos.marketId,
-      user: pos.user,
-      loanToken: market?.loanToken,
-      collateralToken: market?.collateralToken,
-      borrowShares: pos.borrowShares.toString() + "n",
-      collateral: pos.collateral.toString() + "n",
-      supplyShares: pos.supplyShares.toString() + "n",
-      // Placeholder values for Milestone 1
-      seizableCollateral: pos.collateral.toString() + "n",
-      repaidShares: pos.borrowShares.toString() + "n",
+      marketId: p.marketId,
+      user: p.user,
+      loanToken: m?.loanToken,
+      collateralToken: m?.collateralToken,
+      oracle: m?.oracle,
+      lltv: m?.lltv.toString(),
+      borrowShares: p.borrowShares.toString(),
+      borrowAssets: borrowAssets.toString(),
+      collateral: p.collateral.toString(),
+      supplyShares: p.supplyShares.toString(),
+      totalBorrowAssets: m?.totalBorrowAssets.toString(),
+      totalBorrowShares: m?.totalBorrowShares.toString(),
     };
   });
 
-  return c.json({ results, warnings: [] });
+  return c.json({
+    count: candidates.length,
+    candidates,
+  });
 });
 
-// GET /chain/:chainId/withdraw-queue/:address
-// Returns withdraw queue for a specific vault
-ponder.get("/chain/:chainId/withdraw-queue/:address", async (c) => {
-  const chainId = parseInt(c.req.param("chainId"), 10);
-  const address = c.req.param("address");
+// GET /api/stats - Indexer statistics
+app.get("/api/stats", async (c) => {
+  const marketCount = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(schema.market);
 
-  const { db } = c.var;
+  const positionCount = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(schema.position);
 
-  const vault = await db
-    .select()
-    .from(db.sql.vault)
-    .where(
-      and(
-        eq(db.sql.vault.chainId, chainId),
-        eq(db.sql.vault.address, address as `0x${string}`)
-      )
-    )
-    .limit(1);
+  const debtPositionCount = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(schema.position)
+    .where(gt(schema.position.borrowShares, 0n));
 
-  if (vault.length === 0) {
-    return c.json({ error: "Vault not found" }, 404);
-  }
-
-  return c.json(vault[0].withdrawQueue || []);
+  return c.json({
+    markets: Number(marketCount[0]?.count || 0),
+    positions: Number(positionCount[0]?.count || 0),
+    positionsWithDebt: Number(debtPositionCount[0]?.count || 0),
+    timestamp: Date.now(),
+  });
 });
+
+export default app;

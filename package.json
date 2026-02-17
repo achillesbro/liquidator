@@ -15,7 +15,7 @@
     "morpho:deploy": "pnpm --filter @packages/executors hardhat:deploy:morpho",
     "ponder:db": "docker-compose -f apps/ponder/docker-compose.yml up -d",
     "ponder:db:down": "docker-compose -f apps/ponder/docker-compose.yml down -v",
-    "ponder:start": "pnpm --filter @apps/ponder start -- --schema public",
+    "ponder:start": "pnpm --filter @apps/ponder start",
     "ponder:dev": "pnpm ponder:db && pnpm ponder:start",
     "ponder:health": "node apps/ponder/scripts/healthcheck.js",
     "docker:morpho:build": "docker compose -f deploy/docker-compose.morpho.yml build",

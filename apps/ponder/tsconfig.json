@@ -9,11 +9,9 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "types": ["node"],
-    "paths": {
-      "@/*": ["./src/*"]
-    }
+    "noEmit": true,
+    "lib": ["ES2022"]
   },
-  "include": ["src/**/*", "ponder.config.ts", "ponder.schema.ts", "abis/**/*"],
+  "include": ["./**/*.ts"],
   "exclude": ["node_modules", ".ponder"]
 }

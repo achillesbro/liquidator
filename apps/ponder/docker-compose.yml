@@ -4,18 +4,60 @@ services:
     container_name: morpho-ponder-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-ponder}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - ponder-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    # Performance tuning for indexing
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=1GB"
+      - "-c"
+      - "effective_cache_size=3GB"
+      - "-c"
+      - "maintenance_work_mem=256MB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "max_connections=100"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "wal_buffers=16MB"
+      - "-c"
+      - "random_page_cost=1.1"
+
+  ponder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: morpho-ponder
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-ponder}
+      DATABASE_SCHEMA: public
+      RPC_URL_999: ${RPC_URL_999:-https://rpc.hyperliquid.xyz/evm}
+      PORT: ${PONDER_PORT:-42069}
+    ports:
+      - "${PONDER_PORT:-42069}:42069"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:42069/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 volumes:
   ponder-db-data:

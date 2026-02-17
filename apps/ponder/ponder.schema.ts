@@ -1,55 +1,67 @@
-import { onchainTable, index } from "ponder";
+import { index, onchainTable, primaryKey, relations } from "ponder";
 
-// Market table - stores Morpho Blue market data
+/*//////////////////////////////////////////////////////////////
+                            MARKETS
+//////////////////////////////////////////////////////////////*/
+
 export const market = onchainTable(
   "market",
   (t) => ({
-    id: t.hex().primaryKey(),
     chainId: t.integer().notNull(),
+    id: t.hex().notNull(),
+
+    // MarketParams fields
     loanToken: t.hex().notNull(),
     collateralToken: t.hex().notNull(),
     oracle: t.hex().notNull(),
     irm: t.hex().notNull(),
     lltv: t.bigint().notNull(),
-    totalSupplyAssets: t.bigint().notNull(),
-    totalSupplyShares: t.bigint().notNull(),
-    totalBorrowAssets: t.bigint().notNull(),
-    totalBorrowShares: t.bigint().notNull(),
+
+    // Market fields
+    totalSupplyAssets: t.bigint().notNull().default(0n),
+    totalSupplyShares: t.bigint().notNull().default(0n),
+    totalBorrowAssets: t.bigint().notNull().default(0n),
+    totalBorrowShares: t.bigint().notNull().default(0n),
     lastUpdate: t.bigint().notNull(),
-    fee: t.bigint().notNull(),
+    fee: t.bigint().notNull().default(0n),
+
+    // AdaptiveCurveIrm fields
+    rateAtTarget: t.bigint().notNull().default(0n),
   }),
   (table) => ({
-    chainIdIdx: index().on(table.chainId),
-  })
+    pk: primaryKey({ columns: [table.chainId, table.id] }),
+  }),
 );
 
-// Position table - stores user positions in markets
+export const marketRelations = relations(market, ({ many }) => ({
+  positions: many(position),
+}));
+
+/*//////////////////////////////////////////////////////////////
+                            POSITIONS
+//////////////////////////////////////////////////////////////*/
+
 export const position = onchainTable(
   "position",
   (t) => ({
-    id: t.text().primaryKey(),
     chainId: t.integer().notNull(),
     marketId: t.hex().notNull(),
     user: t.hex().notNull(),
-    supplyShares: t.bigint().notNull(),
-    borrowShares: t.bigint().notNull(),
-    collateral: t.bigint().notNull(),
+
+    // Position fields
+    supplyShares: t.bigint().notNull().default(0n),
+    borrowShares: t.bigint().notNull().default(0n),
+    collateral: t.bigint().notNull().default(0n),
   }),
   (table) => ({
-    marketUserIdx: index().on(table.marketId, table.user),
-  })
+    pk: primaryKey({ columns: [table.chainId, table.marketId, table.user] }),
+    marketIdx: index().on(table.chainId, table.marketId),
+  }),
 );
 
-// Vault table - stores MetaMorpho vault data with withdraw queues
-export const vault = onchainTable(
-  "vault",
-  (t) => ({
-    id: t.text().primaryKey(),
-    chainId: t.integer().notNull(),
-    address: t.hex().notNull(),
-    withdrawQueue: t.text().array().notNull(),
+export const positionRelations = relations(position, ({ one }) => ({
+  market: one(market, {
+    fields: [position.chainId, position.marketId],
+    references: [market.chainId, market.id],
   }),
-  (table) => ({
-    addressIdx: index().on(table.address),
-  })
-);
+}));

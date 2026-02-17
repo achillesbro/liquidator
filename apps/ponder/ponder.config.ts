@@ -1,36 +1,32 @@
-import { config as loadEnv } from "dotenv";
 import { createConfig } from "ponder";
-import { http } from "viem";
-import MorphoBlueAbi from "./abis/MorphoBlue.json";
 
-// Load .env file
-loadEnv();
+import { morphoBlueAbi } from "./abis/MorphoBlue";
 
-const RPC_URL_999 = process.env.RPC_URL_999 || "https://rpc.hyperliquid.xyz/evm";
-const PORT = parseInt(process.env.PORT || "42069", 10);
+// Morpho Blue on HyperEVM
+const MORPHO_BLUE_ADDRESS = "0x68e37dE8d93d3496ae143F2E900490f6280C57cD" as const;
+const MORPHO_BLUE_START_BLOCK = 1988429;
 
 export default createConfig({
-  database: {
-    kind: "postgres",
-    connectionString: process.env.DATABASE_URL!,
-    schema: process.env.DATABASE_SCHEMA || "public",
-  },
-  networks: {
+  chains: {
     hyperevm: {
-      chainId: 999,
-      transport: http(RPC_URL_999),
+      id: 999,
+      rpc: process.env.RPC_URL_999 ?? "https://rpc.hyperliquid.xyz/evm",
     },
   },
   contracts: {
     MorphoBlue: {
-      network: "hyperevm",
-      address: "0x68e37dE8d93d3496ae143F2E900490f6280C57cD",
-      abi: MorphoBlueAbi,
-      // Morpho Blue deployment block on HyperEVM
-      startBlock: 1988429,
+      abi: morphoBlueAbi,
+      chain: {
+        hyperevm: {
+          address: MORPHO_BLUE_ADDRESS,
+          startBlock: MORPHO_BLUE_START_BLOCK,
+        },
+      },
     },
   },
-  options: {
-    port: PORT,
+  database: {
+    kind: "postgres",
+    connectionString:
+      process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/ponder",
   },
 });
